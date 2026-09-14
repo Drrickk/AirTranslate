@@ -15,8 +15,6 @@ final class LiveTranslateViewModel: ObservableObject {
     @Published var autoSpeakTranslation = true
     @Published var speakMyTranslationOnSpeaker = true
     @Published var preferBluetoothMic = false
-    @Published var allowOnlineSpeechFallback = true
-    @Published var speechRecognitionModeText = "离线优先"
     @Published var summaryText = ""
     @Published var summaryMode = ""
     @Published var summaryEngine: SummaryEngineChoice = .automatic
@@ -70,15 +68,14 @@ final class LiveTranslateViewModel: ObservableObject {
     private func startListeningTask() async {
         summaryText = ""
         summaryMode = ""
-        statusMessage = "正在启动语音识别…"
+        statusMessage = "正在启动设备端语音识别…"
         let inputLanguage = currentInputLanguage
         let outputLanguage = currentOutputLanguage
 
         do {
-            let recognitionMode = try await captureService.start(
+            try await captureService.start(
                 localeIdentifier: inputLanguage.speechLocaleIdentifier,
                 preferBluetoothMic: preferBluetoothMic,
-                allowOnlineFallback: allowOnlineSpeechFallback,
                 onPartial: { [weak self] text in
                     await MainActor.run { self?.partialTranscript = text }
                 },
@@ -90,8 +87,7 @@ final class LiveTranslateViewModel: ObservableObject {
                 }
             )
             isListening = true
-            speechRecognitionModeText = recognitionMode.statusText
-            statusMessage = "\(recognitionMode.statusText) · \(inputLanguage.name) → \(outputLanguage.name)"
+            statusMessage = "正在离线识别 · \(inputLanguage.name) → \(outputLanguage.name)"
             routeMessage = await captureService.currentRouteDescription()
         } catch {
             isListening = false

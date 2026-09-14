@@ -1,27 +1,77 @@
 @preconcurrency import AVFoundation
-@preconcurrency import Speech
+import Speech
 import Foundation
 
-@MainActor
-final class SpeechCaptureService: NSObject {
-    enum RecognitionMode: Equatable {
-        case onDevice
-        case online
+private struct SendableAudioBuffer: @unchecked Sendable {
+    let buffer: AVAudioPCMBuffer
+}
 
-        var statusText: String {
+private final class SpeechAudioConverter {
+    enum ConversionError: LocalizedError {
+        case cannotCreateConverter
+        case cannotCreateBuffer
+        case conversionFailed(String)
+
+        var errorDescription: String? {
             switch self {
-            case .onDevice: return "设备端离线识别"
-            case .online: return "Apple 在线识别"
+            case .cannotCreateConverter:
+                return "无法创建语音音频转换器。"
+            case .cannotCreateBuffer:
+                return "无法创建语音音频缓冲区。"
+            case .conversionFailed(let detail):
+                return "音频格式转换失败：\(detail)"
             }
         }
     }
 
+    func convert(_ buffer: AVAudioPCMBuffer, to targetFormat: AVAudioFormat) throws -> AVAudioPCMBuffer {
+        if buffer.format == targetFormat {
+            return buffer
+        }
+
+        guard let converter = AVAudioConverter(from: buffer.format, to: targetFormat) else {
+            throw ConversionError.cannotCreateConverter
+        }
+        converter.primeMethod = .none
+
+        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+        let capacity = max(
+            AVAudioFrameCount(1),
+            AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up))
+        )
+
+        guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
+            throw ConversionError.cannotCreateBuffer
+        }
+
+        var provided = false
+        var conversionError: NSError?
+        let status = converter.convert(to: converted, error: &conversionError) { _, inputStatus in
+            if provided {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            provided = true
+            inputStatus.pointee = .haveData
+            return buffer
+        }
+
+        guard status != .error else {
+            throw ConversionError.conversionFailed(conversionError?.localizedDescription ?? "未知错误")
+        }
+
+        return converted
+    }
+}
+
+@MainActor
+final class SpeechCaptureService: NSObject {
     enum ServiceError: LocalizedError {
         case microphoneDenied
-        case speechPermissionDenied
+        case speechTranscriberUnavailable
         case unsupportedLocale(String)
-        case onDeviceRecognitionUnavailable(String)
-        case onlineRecognitionUnavailable(String)
+        case modelUnavailable(String)
+        case analyzerFormatUnavailable(String)
         case noAudioDevice
         case failedToStart(String)
 
@@ -29,117 +79,121 @@ final class SpeechCaptureService: NSObject {
             switch self {
             case .microphoneDenied:
                 return "没有麦克风权限，请到系统设置中允许访问。"
-            case .speechPermissionDenied:
-                return "没有语音识别权限，请到系统设置中允许访问。"
+            case .speechTranscriberUnavailable:
+                return "这台设备不支持 iOS 26 新版端侧语音识别模型。"
             case .unsupportedLocale(let locale):
-                return "当前设备不支持 \(locale) 的语音识别。"
-            case .onDeviceRecognitionUnavailable(let locale):
-                return "当前设备没有可用的 \(locale) 设备端语音识别资源。可开启“允许联网语音识别兜底”继续使用。"
-            case .onlineRecognitionUnavailable(let locale):
-                return "\(locale) 的 Apple 在线语音识别当前不可用，请检查网络后重试。"
+                return "SpeechTranscriber 暂不支持 \(locale)。"
+            case .modelUnavailable(let locale):
+                return "无法准备 \(locale) 的离线语音模型。请联网后重试首次下载。"
+            case .analyzerFormatUnavailable(let locale):
+                return "\(locale) 离线语音模型尚未准备完成，无法取得识别音频格式。"
             case .noAudioDevice:
                 return "没有找到可用的音频输入设备。"
             case .failedToStart(let detail):
-                return "无法启动语音识别：\(detail)"
+                return "无法启动离线语音识别：\(detail)"
             }
         }
     }
 
     private var audioEngine: AVAudioEngine?
-    private var speechRecognizer: SFSpeechRecognizer?
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-    private var sessionToken: UUID?
-    private(set) var recognitionMode: RecognitionMode?
+    private var audioContinuation: AsyncStream<SendableAudioBuffer>.Continuation?
+    private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var analyzer: SpeechAnalyzer?
+    private var transcriber: SpeechTranscriber?
+    private var analyzerFormat: AVAudioFormat?
+    private var audioFeedTask: Task<Void, Never>?
+    private var resultTask: Task<Void, Never>?
 
     func start(
         localeIdentifier: String,
         preferBluetoothMic: Bool,
-        allowOnlineFallback: Bool,
         onPartial: @escaping @Sendable (String) async -> Void,
         onFinal: @escaping @Sendable (String) async -> Void,
         onStatus: @escaping @Sendable (String) async -> Void
-    ) async throws -> RecognitionMode {
+    ) async throws {
         await stop()
 
         guard await requestMicrophonePermission() else {
             throw ServiceError.microphoneDenied
         }
-        guard await requestSpeechRecognitionPermission() else {
-            throw ServiceError.speechPermissionDenied
+
+        guard SpeechTranscriber.isAvailable else {
+            throw ServiceError.speechTranscriberUnavailable
         }
 
         try configureAudioSession(preferBluetoothMic: preferBluetoothMic)
 
-        let locale = Locale(identifier: localeIdentifier)
-        guard let recognizer = SFSpeechRecognizer(locale: locale) else {
+        let requestedLocale = Locale(identifier: localeIdentifier)
+        guard let supportedLocale = await SpeechTranscriber.supportedLocale(equivalentTo: requestedLocale) else {
             throw ServiceError.unsupportedLocale(localeIdentifier)
         }
 
-        let mode: RecognitionMode
-        if recognizer.supportsOnDeviceRecognition {
-            mode = .onDevice
-        } else if allowOnlineFallback {
-            guard recognizer.isAvailable else {
-                throw ServiceError.onlineRecognitionUnavailable(localeIdentifier)
+        let transcriber = SpeechTranscriber(locale: supportedLocale, preset: .progressiveTranscription)
+        self.transcriber = transcriber
+
+        try await ensureModel(
+            for: transcriber,
+            localeName: localeIdentifier,
+            onStatus: onStatus
+        )
+
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+            throw ServiceError.analyzerFormatUnavailable(localeIdentifier)
+        }
+        self.analyzerFormat = analyzerFormat
+
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        self.analyzer = analyzer
+
+        let (inputSequence, inputContinuation) = AsyncStream<AnalyzerInput>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+        self.inputContinuation = inputContinuation
+
+        resultTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                for try await result in transcriber.results {
+                    if Task.isCancelled { break }
+                    let text = String(result.text.characters)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty else { continue }
+
+                    if result.isFinal {
+                        await onPartial("")
+                        await onFinal(text)
+                    } else {
+                        await onPartial(text)
+                    }
+                }
+            } catch {
+                if !Task.isCancelled {
+                    await onStatus("端侧语音识别停止：\(error.localizedDescription)")
+                }
             }
-            mode = .online
-        } else {
-            throw ServiceError.onDeviceRecognitionUnavailable(localeIdentifier)
         }
 
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = (mode == .onDevice)
-        request.taskHint = .dictation
-        if #available(iOS 16.0, *) {
-            request.addsPunctuation = true
-        }
+        try await analyzer.start(inputSequence: inputSequence)
 
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
+            await analyzer.cancelAndFinishNow()
             throw ServiceError.noAudioDevice
         }
 
-        let token = UUID()
-        sessionToken = token
-        speechRecognizer = recognizer
-        recognitionRequest = request
-        recognitionMode = mode
-        audioEngine = engine
-
-        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            Task { @MainActor [weak self] in
-                guard let self, self.sessionToken == token else { return }
-
-                if let result {
-                    let text = result.bestTranscription.formattedString
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !text.isEmpty {
-                        if result.isFinal {
-                            await onPartial("")
-                            await onFinal(text)
-                        } else {
-                            await onPartial(text)
-                        }
-                    }
-                }
-
-                if let error, self.sessionToken == token {
-                    let prefix = self.recognitionMode == .online ? "在线语音识别已停止" : "离线语音识别已停止"
-                    await onStatus("\(prefix)：\(error.localizedDescription)")
-                }
-            }
-        }
+        let (audioStream, audioContinuation) = AsyncStream<SendableAudioBuffer>.makeStream(
+            bufferingPolicy: .bufferingNewest(16)
+        )
+        self.audioContinuation = audioContinuation
 
         inputNode.installTap(
             onBus: 0,
-            bufferSize: 2048,
+            bufferSize: 4096,
             format: recordingFormat
         ) { buffer, _ in
-            request.append(buffer)
+            audioContinuation.yield(SendableAudioBuffer(buffer: buffer))
         }
 
         engine.prepare()
@@ -147,45 +201,56 @@ final class SpeechCaptureService: NSObject {
             try engine.start()
         } catch {
             inputNode.removeTap(onBus: 0)
-            recognitionTask?.cancel()
-            recognitionTask = nil
-            recognitionRequest = nil
-            speechRecognizer = nil
-            audioEngine = nil
-            recognitionMode = nil
-            sessionToken = nil
+            audioContinuation.finish()
+            inputContinuation.finish()
+            await analyzer.cancelAndFinishNow()
             throw ServiceError.failedToStart(error.localizedDescription)
         }
+        self.audioEngine = engine
 
-        await onStatus(mode == .onDevice ? "正在设备端离线识别" : "正在使用 Apple 在线语音识别")
-        return mode
+        audioFeedTask = Task { [weak self] in
+            guard let self else { return }
+            let converter = SpeechAudioConverter()
+
+            do {
+                for await wrapped in audioStream {
+                    if Task.isCancelled { break }
+                    let converted = try converter.convert(wrapped.buffer, to: analyzerFormat)
+                    inputContinuation.yield(AnalyzerInput(buffer: converted))
+                }
+            } catch {
+                if !Task.isCancelled {
+                    await onStatus("麦克风音频转换停止：\(error.localizedDescription)")
+                }
+            }
+        }
+
+        await onStatus("设备端离线识别 · \(supportedLocale.identifier)")
     }
 
     func prepareLocales(
         _ localeIdentifiers: [String],
         onStatus: @escaping @Sendable (String) async -> Void
     ) async throws {
-        guard await requestSpeechRecognitionPermission() else {
-            throw ServiceError.speechPermissionDenied
+        guard SpeechTranscriber.isAvailable else {
+            throw ServiceError.speechTranscriberUnavailable
         }
 
-        var messages: [String] = []
         for localeIdentifier in Array(Set(localeIdentifiers)).sorted() {
-            let locale = Locale(identifier: localeIdentifier)
-            guard let recognizer = SFSpeechRecognizer(locale: locale) else {
-                messages.append("\(localeIdentifier)：不支持")
-                continue
+            let requestedLocale = Locale(identifier: localeIdentifier)
+            guard let supportedLocale = await SpeechTranscriber.supportedLocale(equivalentTo: requestedLocale) else {
+                throw ServiceError.unsupportedLocale(localeIdentifier)
             }
-            if recognizer.supportsOnDeviceRecognition {
-                messages.append("\(localeIdentifier)：设备端离线可用")
-            } else if recognizer.isAvailable {
-                messages.append("\(localeIdentifier)：仅在线识别可用")
-            } else {
-                messages.append("\(localeIdentifier)：当前不可用")
-            }
+
+            let transcriber = SpeechTranscriber(locale: supportedLocale, preset: .progressiveTranscription)
+            try await ensureModel(
+                for: transcriber,
+                localeName: localeIdentifier,
+                onStatus: onStatus
+            )
         }
 
-        await onStatus(messages.joined(separator: " · "))
+        await onStatus("端侧语音模型已准备；翻译语言包由系统 Translation 框架继续准备")
     }
 
     func currentRouteDescription() -> String {
@@ -198,9 +263,6 @@ final class SpeechCaptureService: NSObject {
     }
 
     func stop() async {
-        let token = sessionToken
-        sessionToken = nil
-
         if let engine = audioEngine {
             if engine.isRunning {
                 engine.stop()
@@ -209,31 +271,63 @@ final class SpeechCaptureService: NSObject {
         }
         audioEngine = nil
 
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        recognitionRequest = nil
-        speechRecognizer = nil
-        recognitionMode = nil
+        audioContinuation?.finish()
+        audioContinuation = nil
 
-        if token != nil {
-            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        audioFeedTask?.cancel()
+        audioFeedTask = nil
+
+        inputContinuation?.finish()
+        inputContinuation = nil
+
+        if let analyzer {
+            do {
+                try await analyzer.finalizeAndFinishThroughEndOfInput()
+            } catch {
+                await analyzer.cancelAndFinishNow()
+            }
         }
+
+        resultTask?.cancel()
+        resultTask = nil
+        analyzer = nil
+        transcriber = nil
+        analyzerFormat = nil
+
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    private func requestSpeechRecognitionPermission() async -> Bool {
-        switch SFSpeechRecognizer.authorizationStatus() {
-        case .authorized:
-            return true
-        case .notDetermined:
-            return await withCheckedContinuation { continuation in
-                SFSpeechRecognizer.requestAuthorization { status in
-                    continuation.resume(returning: status == .authorized)
-                }
-            }
-        default:
-            return false
+    private func ensureModel(
+        for transcriber: SpeechTranscriber,
+        localeName: String,
+        onStatus: @escaping @Sendable (String) async -> Void
+    ) async throws {
+        let initialStatus = await AssetInventory.status(forModules: [transcriber])
+
+        switch initialStatus {
+        case .installed:
+            await onStatus("\(localeName) 端侧语音模型已安装")
+            return
+        case .unsupported:
+            throw ServiceError.modelUnavailable(localeName)
+        case .supported, .downloading:
+            break
+        @unknown default:
+            break
         }
+
+        await onStatus("正在下载 \(localeName) 端侧语音模型…首次使用需要联网")
+
+        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            try await request.downloadAndInstall()
+        }
+
+        let finalStatus = await AssetInventory.status(forModules: [transcriber])
+        guard finalStatus == .installed else {
+            throw ServiceError.modelUnavailable(localeName)
+        }
+
+        await onStatus("\(localeName) 端侧语音模型下载完成")
     }
 
     private func requestMicrophonePermission() async -> Bool {
