@@ -39,7 +39,7 @@ actor SpeechCaptureService {
         try configureAudioSession(preferBluetoothMic: preferBluetoothMic)
 
         let requestedLocale = Locale(identifier: localeIdentifier)
-        guard let supportedLocale = SpeechTranscriber.supportedLocale(equivalentTo: requestedLocale) else {
+        guard let supportedLocale = await SpeechTranscriber.supportedLocale(equivalentTo: requestedLocale) else {
             throw ServiceError.unsupportedLocale(localeIdentifier)
         }
 
@@ -103,7 +103,7 @@ actor SpeechCaptureService {
     ) async throws {
         for localeIdentifier in Array(Set(localeIdentifiers)) {
             let requestedLocale = Locale(identifier: localeIdentifier)
-            guard let supportedLocale = SpeechTranscriber.supportedLocale(equivalentTo: requestedLocale) else {
+            guard let supportedLocale = await SpeechTranscriber.supportedLocale(equivalentTo: requestedLocale) else {
                 throw ServiceError.unsupportedLocale(localeIdentifier)
             }
             let transcriber = SpeechTranscriber(locale: supportedLocale, preset: .progressiveLiveTranscription)
@@ -161,7 +161,8 @@ actor SpeechCaptureService {
             }
         }
 
-        try session.setCategory(.playAndRecord, mode: .spokenAudio, options: options)
+        let audioMode: AVAudioSession.Mode = preferBluetoothMic ? .default : .spokenAudio
+        try session.setCategory(.playAndRecord, mode: audioMode, options: options)
         try session.setActive(true)
 
         if !preferBluetoothMic,
