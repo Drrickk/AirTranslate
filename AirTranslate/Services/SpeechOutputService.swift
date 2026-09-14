@@ -1,7 +1,7 @@
 import AVFoundation
 
 @MainActor
-final class SpeechOutputService: NSObject, AVSpeechSynthesizerDelegate {
+final class SpeechOutputService: NSObject {
     enum OutputRoute {
         case current
         case speaker
@@ -37,17 +37,29 @@ final class SpeechOutputService: NSObject, AVSpeechSynthesizerDelegate {
         restoreRouteIfNeeded()
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        restoreRouteIfNeeded()
-    }
-
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        restoreRouteIfNeeded()
-    }
-
     private func restoreRouteIfNeeded() {
         guard overriddenToSpeaker else { return }
         try? AVAudioSession.sharedInstance().overrideOutputAudioPort(.none)
         overriddenToSpeaker = false
+    }
+}
+
+extension SpeechOutputService: AVSpeechSynthesizerDelegate {
+    nonisolated func speechSynthesizer(
+        _ synthesizer: AVSpeechSynthesizer,
+        didFinish utterance: AVSpeechUtterance
+    ) {
+        Task { @MainActor in
+            self.restoreRouteIfNeeded()
+        }
+    }
+
+    nonisolated func speechSynthesizer(
+        _ synthesizer: AVSpeechSynthesizer,
+        didCancel utterance: AVSpeechUtterance
+    ) {
+        Task { @MainActor in
+            self.restoreRouteIfNeeded()
+        }
     }
 }
