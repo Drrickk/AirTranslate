@@ -90,7 +90,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: AirTranslate-v0.2.3-build-log
+          name: AirTranslate-v0.4.0-build-log
           path: build.log
           if-no-files-found: ignore
 
@@ -99,16 +99,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf Payload AirTranslate-v0.2.3-unsigned.ipa
+          rm -rf Payload AirTranslate-v0.4.0-unsigned.ipa
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/AirTranslate.app Payload/
-          ditto -c -k --sequesterRsrc --keepParent Payload AirTranslate-v0.2.3-unsigned.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload AirTranslate-v0.4.0-unsigned.ipa
 
       - name: Upload IPA and build log
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: AirTranslate-v0.2.3-unsigned
+          name: AirTranslate-v0.4.0-unsigned
           path: |
-            AirTranslate-v0.2.3-unsigned.ipa
+            AirTranslate-v0.4.0-unsigned.ipa
             build.log
