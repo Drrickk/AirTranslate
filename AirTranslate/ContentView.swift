@@ -1,5 +1,5 @@
 import SwiftUI
-import Translation
+@preconcurrency import Translation
 
 struct ContentView: View {
     @StateObject private var model = LiveTranslateViewModel()
