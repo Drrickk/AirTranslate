@@ -31,6 +31,12 @@ final class LiveTranslateViewModel: ObservableObject {
     private var forwardQueue: [TranslationRequest] = []
     private var reverseQueue: [TranslationRequest] = []
 
+    init() {
+        if let phase = SpeechCaptureService.lastStartupPhase {
+            statusMessage = "上次启动停在：\(phase)"
+        }
+    }
+
     var currentInputLanguage: AppLanguage {
         if mode == .conversation && activeSide == .me { return targetLanguage }
         return sourceLanguage
