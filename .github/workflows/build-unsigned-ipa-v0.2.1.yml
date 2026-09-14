@@ -25,7 +25,6 @@ jobs:
           )
           if [ -z "$XCODE_PATH" ]; then
             echo "No Xcode 26 installation found"
-            ls -1 /Applications | grep Xcode || true
             exit 1
           fi
           echo "Using $XCODE_PATH"
@@ -44,7 +43,9 @@ jobs:
           xcodebuild \
             -resolvePackageDependencies \
             -project AirTranslate.xcodeproj \
-            -scheme AirTranslate
+            -scheme AirTranslate \
+            -skipPackagePluginValidation \
+            -skipMacroValidation
 
       - name: Build unsigned app
         run: |
@@ -56,10 +57,12 @@ jobs:
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' \
-            build | tee build.log
+            build 2>&1 | tee build.log
 
       - name: Upload build log on failure
         if: failure()
