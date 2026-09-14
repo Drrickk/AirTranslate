@@ -30,7 +30,7 @@ struct ContentView: View {
                     }
 
                     Menu {
-                        Button("检查离线语音并准备翻译包", systemImage: "arrow.down.circle") {
+                        Button("检查语音识别与翻译语言包", systemImage: "arrow.down.circle") {
                             model.prepareOfflineSpeechPacks()
                             forwardConfiguration?.invalidate()
                             reverseConfiguration?.invalidate()
@@ -208,6 +208,16 @@ struct ContentView: View {
             Toggle("优先使用 AirPods 麦克风", isOn: $model.preferBluetoothMic)
                 .disabled(model.isListening)
 
+            Toggle("无离线模型时允许联网语音识别", isOn: $model.allowOnlineSpeechFallback)
+                .disabled(model.isListening)
+
+            HStack(spacing: 6) {
+                Image(systemName: model.speechRecognitionModeText == "Apple 在线识别" ? "network" : "iphone")
+                Text("语音识别：\(model.speechRecognitionModeText)")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Circle()
@@ -336,7 +346,7 @@ struct ContentView: View {
     private var privacyCard: some View {
         VStack(alignment: .leading, spacing: 7) {
             Label("离线与隐私", systemImage: "lock.shield").font(.headline)
-            Text("语音识别和系统 Translation 翻译走 Apple 设备端框架；首次使用语言需要下载资源。Qwen3 离线 AI 只在首次下载模型时联网，模型加载后总结在设备本机运行。会话记录保存到本机 Documents。")
+            Text("语音识别优先使用设备端资源；如果当前语言没有离线模型且你开启了“联网语音识别兜底”，语音会交由 Apple Speech 在线服务识别。系统 Translation 翻译仍使用本地语言包。Qwen3 仅首次下载模型时联网，之后总结在本机运行；会话记录保存在本机 Documents。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

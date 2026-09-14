@@ -4,11 +4,24 @@ import Foundation
 
 @MainActor
 final class SpeechCaptureService: NSObject {
+    enum RecognitionMode: Equatable {
+        case onDevice
+        case online
+
+        var statusText: String {
+            switch self {
+            case .onDevice: return "设备端离线识别"
+            case .online: return "Apple 在线识别"
+            }
+        }
+    }
+
     enum ServiceError: LocalizedError {
         case microphoneDenied
         case speechPermissionDenied
         case unsupportedLocale(String)
         case onDeviceRecognitionUnavailable(String)
+        case onlineRecognitionUnavailable(String)
         case noAudioDevice
         case failedToStart(String)
 
@@ -21,7 +34,9 @@ final class SpeechCaptureService: NSObject {
             case .unsupportedLocale(let locale):
                 return "当前设备不支持 \(locale) 的语音识别。"
             case .onDeviceRecognitionUnavailable(let locale):
-                return "当前设备没有可用的 \(locale) 设备端语音识别资源。请先在系统中下载该语言的听写/语音资源，再重试。"
+                return "当前设备没有可用的 \(locale) 设备端语音识别资源。可开启“允许联网语音识别兜底”继续使用。"
+            case .onlineRecognitionUnavailable(let locale):
+                return "\(locale) 的 Apple 在线语音识别当前不可用，请检查网络后重试。"
             case .noAudioDevice:
                 return "没有找到可用的音频输入设备。"
             case .failedToStart(let detail):
@@ -35,14 +50,16 @@ final class SpeechCaptureService: NSObject {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var sessionToken: UUID?
+    private(set) var recognitionMode: RecognitionMode?
 
     func start(
         localeIdentifier: String,
         preferBluetoothMic: Bool,
+        allowOnlineFallback: Bool,
         onPartial: @escaping @Sendable (String) async -> Void,
         onFinal: @escaping @Sendable (String) async -> Void,
         onStatus: @escaping @Sendable (String) async -> Void
-    ) async throws {
+    ) async throws -> RecognitionMode {
         await stop()
 
         guard await requestMicrophonePermission() else {
@@ -58,13 +75,22 @@ final class SpeechCaptureService: NSObject {
         guard let recognizer = SFSpeechRecognizer(locale: locale) else {
             throw ServiceError.unsupportedLocale(localeIdentifier)
         }
-        guard recognizer.supportsOnDeviceRecognition else {
+
+        let mode: RecognitionMode
+        if recognizer.supportsOnDeviceRecognition {
+            mode = .onDevice
+        } else if allowOnlineFallback {
+            guard recognizer.isAvailable else {
+                throw ServiceError.onlineRecognitionUnavailable(localeIdentifier)
+            }
+            mode = .online
+        } else {
             throw ServiceError.onDeviceRecognitionUnavailable(localeIdentifier)
         }
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = true
+        request.requiresOnDeviceRecognition = (mode == .onDevice)
         request.taskHint = .dictation
         if #available(iOS 16.0, *) {
             request.addsPunctuation = true
@@ -81,6 +107,7 @@ final class SpeechCaptureService: NSObject {
         sessionToken = token
         speechRecognizer = recognizer
         recognitionRequest = request
+        recognitionMode = mode
         audioEngine = engine
 
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
@@ -101,7 +128,8 @@ final class SpeechCaptureService: NSObject {
                 }
 
                 if let error, self.sessionToken == token {
-                    await onStatus("离线语音识别已停止：\(error.localizedDescription)")
+                    let prefix = self.recognitionMode == .online ? "在线语音识别已停止" : "离线语音识别已停止"
+                    await onStatus("\(prefix)：\(error.localizedDescription)")
                 }
             }
         }
@@ -124,11 +152,13 @@ final class SpeechCaptureService: NSObject {
             recognitionRequest = nil
             speechRecognizer = nil
             audioEngine = nil
+            recognitionMode = nil
             sessionToken = nil
             throw ServiceError.failedToStart(error.localizedDescription)
         }
 
-        await onStatus("正在设备端离线识别")
+        await onStatus(mode == .onDevice ? "正在设备端离线识别" : "正在使用 Apple 在线语音识别")
+        return mode
     }
 
     func prepareLocales(
@@ -139,18 +169,23 @@ final class SpeechCaptureService: NSObject {
             throw ServiceError.speechPermissionDenied
         }
 
+        var messages: [String] = []
         for localeIdentifier in Array(Set(localeIdentifiers)).sorted() {
-            await onStatus("正在检查 \(localeIdentifier) 离线语音支持…")
             let locale = Locale(identifier: localeIdentifier)
             guard let recognizer = SFSpeechRecognizer(locale: locale) else {
-                throw ServiceError.unsupportedLocale(localeIdentifier)
+                messages.append("\(localeIdentifier)：不支持")
+                continue
             }
-            guard recognizer.supportsOnDeviceRecognition else {
-                throw ServiceError.onDeviceRecognitionUnavailable(localeIdentifier)
+            if recognizer.supportsOnDeviceRecognition {
+                messages.append("\(localeIdentifier)：设备端离线可用")
+            } else if recognizer.isAvailable {
+                messages.append("\(localeIdentifier)：仅在线识别可用")
+            } else {
+                messages.append("\(localeIdentifier)：当前不可用")
             }
         }
 
-        await onStatus("离线语音识别可用；翻译语言包由系统翻译框架继续准备")
+        await onStatus(messages.joined(separator: " · "))
     }
 
     func currentRouteDescription() -> String {
@@ -179,6 +214,7 @@ final class SpeechCaptureService: NSObject {
         recognitionTask = nil
         recognitionRequest = nil
         speechRecognizer = nil
+        recognitionMode = nil
 
         if token != nil {
             try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
