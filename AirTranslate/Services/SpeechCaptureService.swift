@@ -222,7 +222,12 @@ final class SpeechCaptureService: NSObject {
             onBus: 0,
             bufferSize: 4096,
             format: nil
-        ) { buffer, _ in
+        ) { @Sendable buffer, _ in
+            // Swift 6 / AVAudioEngine workaround recommended by Apple DTS:
+            // the tap callback is invoked on an audio thread, so it must not inherit
+            // MainActor isolation from SpeechCaptureService. AsyncStream.Continuation
+            // is safe to yield from this callback.
+            guard buffer.frameLength > 0 else { return }
             audioContinuation.yield(SendableAudioBuffer(buffer: buffer))
         }
         tapInstalled = true
