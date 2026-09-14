@@ -7,6 +7,7 @@ jobs:
   build:
     runs-on: macos-26
     timeout-minutes: 60
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -14,7 +15,7 @@ jobs:
       - name: Select newest installed Xcode 26
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           XCODE_PATH=$(python3 - <<'PY2'
           import glob, re
           paths = glob.glob('/Applications/Xcode_26*.app')
@@ -25,12 +26,24 @@ jobs:
           )
           if [ -z "$XCODE_PATH" ]; then
             echo "No Xcode 26 installation found"
+            ls -1 /Applications | grep Xcode || true
             exit 1
           fi
           echo "Using $XCODE_PATH"
           sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
           xcodebuild -version
           swift --version
+
+      - name: Remove legacy patch source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          find AirTranslate/Services -type f \( \
+            -name 'SpeechCaptureService-v*.swift' -o \
+            -name 'SpeechOutputService-v*.swift' \
+          \) -print -delete || true
+          test -f AirTranslate/Services/SpeechCaptureService.swift
+          test -f AirTranslate/Services/SpeechOutputService.swift
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -48,6 +61,8 @@ jobs:
             -skipMacroValidation
 
       - name: Build unsigned app
+        id: build
+        shell: bash
         run: |
           set -o pipefail
           xcodebuild \
@@ -64,26 +79,36 @@ jobs:
             CODE_SIGN_IDENTITY='' \
             build 2>&1 | tee build.log
 
+      - name: Show concise compiler errors
+        if: failure()
+        shell: bash
+        run: |
+          echo '===== compiler errors ====='
+          grep -nE 'error:|BUILD FAILED|The following build commands failed' build.log | tail -n 120 || true
+
       - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: AirTranslate-v0.2.1-build-log
+          name: AirTranslate-v0.2.3-build-log
           path: build.log
           if-no-files-found: ignore
 
       - name: Package IPA
         if: success()
+        shell: bash
         run: |
+          set -euo pipefail
+          rm -rf Payload AirTranslate-v0.2.3-unsigned.ipa
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/AirTranslate.app Payload/
-          ditto -c -k --sequesterRsrc --keepParent Payload AirTranslate-v0.2.1-unsigned.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload AirTranslate-v0.2.3-unsigned.ipa
 
       - name: Upload IPA and build log
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: AirTranslate-v0.2.1-unsigned
+          name: AirTranslate-v0.2.3-unsigned
           path: |
-            AirTranslate-v0.2.1-unsigned.ipa
+            AirTranslate-v0.2.3-unsigned.ipa
             build.log
