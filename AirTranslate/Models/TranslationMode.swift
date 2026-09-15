@@ -24,6 +24,22 @@ enum ConversationSpeaker: String, Codable, Hashable, Sendable {
     case me
 }
 
+enum TranslationQualityMode: String, CaseIterable, Identifiable, Sendable {
+    case lowLatency = "低延迟"
+    case highQuality = "高质量"
+
+    var id: String { rawValue }
+
+    var description: String {
+        switch self {
+        case .lowLatency:
+            return "只翻译较稳定的实时片段，最终句再完整重译；兼顾速度与准确度。"
+        case .highQuality:
+            return "等待 SpeechTranscriber 给出最终语义单元后再翻译，准确优先。"
+        }
+    }
+}
+
 enum SummaryEngineChoice: String, CaseIterable, Identifiable, Sendable {
     case automatic = "自动"
     case localAI = "离线 AI"

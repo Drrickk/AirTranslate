@@ -1,6 +1,12 @@
 @preconcurrency import AVFoundation
 import Foundation
 
+struct LocalVoiceOption: Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+    let language: String
+}
+
 @MainActor
 final class SpeechOutputService: NSObject {
     enum OutputRoute {
@@ -22,10 +28,25 @@ final class SpeechOutputService: NSObject {
         synthesizer.delegate = self
     }
 
+    func availableVoices(languageCode: String) -> [LocalVoiceOption] {
+        let base = languageCode.split(separator: "-").first.map(String.init)?.lowercased() ?? languageCode.lowercased()
+        return AVSpeechSynthesisVoice.speechVoices()
+            .filter { voice in
+                let voiceBase = voice.language.split(separator: "-").first.map(String.init)?.lowercased() ?? voice.language.lowercased()
+                return voiceBase == base
+            }
+            .map { LocalVoiceOption(id: $0.identifier, name: $0.name, language: $0.language) }
+            .sorted {
+                if $0.language == $1.language { return $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                return $0.language.localizedStandardCompare($1.language) == .orderedAscending
+            }
+    }
+
     @discardableResult
     func speak(
         _ text: String,
         languageCode: String,
+        voiceIdentifier: String? = nil,
         route: OutputRoute = .current,
         baseRate: Float = 0.58,
         adaptiveCatchUp: Bool = true
@@ -35,10 +56,9 @@ final class SpeechOutputService: NSObject {
 
         var didResync = false
 
-        // Once the spoken queue gets several segments behind, continuing to read
-        // every old sentence guarantees ever-growing latency. In catch-up mode we
-        // discard stale audio only (the transcript remains intact) and resume from
-        // the newest completed translation.
+        // If translated speech is several chunks behind, reading every stale
+        // chunk guarantees ever-growing latency. Keep the transcript intact,
+        // discard stale audio only, and resume from the newest translation.
         if adaptiveCatchUp && pendingUtteranceCount >= 4 {
             synthesizer.stopSpeaking(at: .immediate)
             pendingUtteranceCount = 0
@@ -53,7 +73,13 @@ final class SpeechOutputService: NSObject {
         }
 
         let utterance = AVSpeechUtterance(string: clean)
-        utterance.voice = AVSpeechSynthesisVoice(language: languageCode)
+        if let voiceIdentifier,
+           !voiceIdentifier.isEmpty,
+           let selectedVoice = AVSpeechSynthesisVoice(identifier: voiceIdentifier) {
+            utterance.voice = selectedVoice
+        } else {
+            utterance.voice = AVSpeechSynthesisVoice(language: languageCode)
+        }
         utterance.preUtteranceDelay = 0
         utterance.postUtteranceDelay = 0
 
@@ -91,9 +117,6 @@ final class SpeechOutputService: NSObject {
         }
         rate = max(rate, minimumBase)
 
-        // Gradually speed up as translated speech falls behind. Chinese receives
-        // a slightly stronger boost because the default system voice is often
-        // slower than conversational speech at AVSpeechUtterance's default rate.
         let step: Float = isChinese ? 0.035 : 0.03
         rate += Float(min(queueDepth, 3)) * step
         return min(rate, isChinese ? 0.69 : 0.66)

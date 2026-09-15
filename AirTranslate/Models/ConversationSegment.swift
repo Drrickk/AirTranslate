@@ -30,6 +30,7 @@ struct ConversationSegment: Identifiable, Codable, Hashable, Sendable {
 
 enum TranslationRequestPurpose: Hashable, Sendable {
     case preview
+    case speechChunk
     case final
 }
 
@@ -41,11 +42,12 @@ struct TranslationRequest: Identifiable, Hashable, Sendable {
     let sourceLanguage: AppLanguage
     let targetLanguage: AppLanguage
     let purpose: TranslationRequestPurpose
+    let speakAfterTranslation: Bool
 }
 
 /// Thread-safe bridge between the MainActor view model and SwiftUI's long-lived
-/// TranslationSession task. Preview requests are coalesced by the view model,
-/// while final requests are always retained in this stream.
+/// TranslationSession task. Final requests are retained; preview work is
+/// coalesced by the view model so it cannot build an unbounded queue.
 final class TranslationRequestPipe: @unchecked Sendable {
     let stream: AsyncStream<TranslationRequest>
     private let continuation: AsyncStream<TranslationRequest>.Continuation

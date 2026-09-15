@@ -1,13 +1,35 @@
-# AirTranslate v0.5.0 — 低延迟同传
+# AirTranslate v0.6.0 — 稳定分句 / 双阶段翻译 / 本地语音选择
 
-本版重点解决两个实际体验问题：字幕翻译启动太晚，以及中文 TTS 比讲话人慢导致累计延迟。
+本版重点从“单纯追求速度”转为同时控制翻译质量、朗读延迟和本地语音体验。
 
-- TranslationSession 在页面生命周期内常驻，只在语言配置改变时重新准备，不再每句话 invalidate + prepare。
-- SpeechTranscriber 的 partial 字幕约每 300ms 合并一次送入本地 Translation，实时显示预览译文。
-- partial 译文只显示、不朗读；最终结果才进入历史并播报，避免重复念半句话。
-- 中文 TTS 默认基础 rate 调到 0.58，可在 0.50–0.65 手动调整。
-- 开启“语音自动追赶”后，语音队列有积压时动态提速，中文最高约 0.69。
-- 当语音已经落后 4 段以上时，只清理过时的语音队列并追到最新译文；屏幕字幕和完整会话记录不会丢。
-- 保留 v0.4.2 的 SpeechAnalyzer / SpeechTranscriber / AssetInventory 设备端识别与 AVAudioEngine @Sendable 闪退修复。
+## 翻译质量
 
-GitHub Actions 成功产物：`AirTranslate-v0.5.0-unsigned.ipa`。
+- 新增「低延迟 / 高质量」两档。
+- 低延迟模式不再把每个原始 partial 都直接送去翻译，而是优先选择连续识别中已经稳定的文本前缀或带完整标点的片段做预览翻译。
+- partial 译文只作为屏幕预览；SpeechTranscriber 最终结果仍会整句重新翻译并覆盖成最终译文。
+- 高质量模式关闭 partial 翻译，只使用最终语义单元。
+
+## 低延迟朗读
+
+- 低延迟模式下可单独开启「低延迟朗读」。
+- 当讲话出现短暂停顿（约 520 ms）或形成较明确的句尾时，稳定片段可以提前翻译并朗读，不必一直等整段 final。
+- 已提前朗读的原文前缀会记录下来；最终句到来后只补朗读尚未播放的尾部，避免整句重复。
+- 如果 SpeechTranscriber 后续把已经朗读过的前缀改写，App 会优先避免重复播报，屏幕最终译文仍以完整 final 为准。
+- 保留 v0.5 的 TTS 自动追赶：队列积压时动态提速，严重积压时只丢弃过时音频，不删除字幕和历史记录。
+
+## 本机语音选择
+
+- 新增「目标语言声音」。
+- 使用 `AVSpeechSynthesisVoice.speechVoices()` 读取 iPhone 当前可用的目标语言语音。
+- 可选择「系统默认」或具体本机声音；不接 Azure、Edge 或第三方云 TTS。
+- 语言切换后会自动刷新该语言可用语音列表。
+
+## 保留能力
+
+- iOS 26 `SpeechAnalyzer + SpeechTranscriber + AssetInventory` 设备端识别。
+- `TranslationSession` 常驻预热，本地系统翻译。
+- Apple 本地 AI / Qwen3 离线总结。
+- 双人对话、AirPods 路由、本地历史与导出。
+- Swift 6 `AVAudioEngine.installTap` 的 `@Sendable` 闪退修复。
+
+GitHub Actions 成功产物：`AirTranslate-v0.6.0-unsigned.ipa`。

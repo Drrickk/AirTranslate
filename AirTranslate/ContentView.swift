@@ -15,6 +15,7 @@ struct ContentView: View {
                     languageCard
                     if model.mode == .conversation { conversationTurnCard }
                     controlsCard
+                    translationQualityCard
                     transcriptCard
                     summaryCard
                     privacyCard
@@ -55,14 +56,21 @@ struct ContentView: View {
         }
         .onAppear {
             resetTranslationConfigurations()
+            model.refreshVoiceOptions()
             Task { await model.refreshHistory() }
         }
-        .onChange(of: model.sourceLanguage) { _, _ in resetTranslationConfigurations() }
-        .onChange(of: model.targetLanguage) { _, _ in resetTranslationConfigurations() }
+        .onChange(of: model.sourceLanguage) { _, _ in
+            resetTranslationConfigurations()
+        }
+        .onChange(of: model.targetLanguage) { _, _ in
+            resetTranslationConfigurations()
+            model.refreshVoiceOptions()
+        }
+        .onChange(of: model.translationQuality) { _, _ in
+            model.translationQualityChanged()
+        }
         .translationTask(forwardConfiguration) { session in
             do {
-                // Warm once and keep this TranslationSession alive for the entire
-                // listening session. Do not invalidate/re-prepare for every sentence.
                 try await session.prepareTranslation()
                 for await request in model.forwardTranslationPipe.stream {
                     if Task.isCancelled { break }
@@ -122,6 +130,7 @@ struct ContentView: View {
                 languagePicker(title: model.mode == .conversation ? "对方语言" : "听到", selection: $model.sourceLanguage)
                 Button {
                     model.swapLanguages()
+                    resetTranslationConfigurations()
                 } label: {
                     Image(systemName: "arrow.left.arrow.right")
                         .font(.title3)
@@ -203,11 +212,21 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
 
-            Toggle("低延迟实时翻译", isOn: $model.lowLatencyTranslation)
-
             Toggle("自动朗读译文", isOn: $model.autoSpeakTranslation)
             if model.autoSpeakTranslation {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("目标语言声音")
+                        Spacer()
+                        Picker("目标语言声音", selection: $model.selectedVoiceIdentifier) {
+                            Text("系统默认").tag("")
+                            ForEach(model.voiceOptions) { voice in
+                                Text("\(voice.name) · \(voice.language)").tag(voice.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+
                     HStack {
                         Text("基础朗读速度")
                         Spacer()
@@ -219,6 +238,7 @@ struct ContentView: View {
                     Toggle("语音自动追赶，避免越听越落后", isOn: $model.adaptiveSpeechCatchUp)
                 }
             }
+
             if model.mode == .conversation {
                 Toggle("我说中文后，把外语译文从 iPhone 外放", isOn: $model.speakMyTranslationOnSpeaker)
                     .disabled(!model.autoSpeakTranslation)
@@ -244,6 +264,33 @@ struct ContentView: View {
         .cardStyle()
     }
 
+    private var translationQualityCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("翻译质量", systemImage: "character.book.closed")
+                .font(.headline)
+
+            Picker("翻译质量", selection: $model.translationQuality) {
+                ForEach(TranslationQualityMode.allCases) { quality in
+                    Text(quality.rawValue).tag(quality)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Text(model.translationQuality.description)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            if model.translationQuality == .lowLatency {
+                Toggle("低延迟朗读", isOn: $model.lowLatencySpeech)
+                    .disabled(!model.autoSpeakTranslation)
+                Text("短暂停顿或稳定分句后即可提前翻译并朗读；最终句仍会完整重译用于字幕。若识别后续发生修正，会优先避免重复播报。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .cardStyle()
+    }
+
     private var transcriptCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -260,23 +307,41 @@ struct ContentView: View {
                 )
                 .frame(minHeight: 160)
             } else {
-                ForEach(model.segments) { segment in
-                    VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(model.segments.enumerated()), id: \.element.id) { index, segment in
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            if segment.translatedText.isEmpty {
+                                Label("翻译中", systemImage: "ellipsis.circle")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Label("已完成", systemImage: "checkmark.circle.fill")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.green)
+                            }
+                            Spacer()
+                            Text("#\(index + 1)")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+
                         if let speaker = segment.speaker {
                             Text(speaker == .me ? "我" : "对方")
                                 .font(.caption.bold())
                                 .foregroundStyle(.secondary)
                         }
                         Text(segment.sourceText)
+                            .foregroundStyle(.secondary)
                         if segment.translatedText.isEmpty {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.small)
-                                Text("正在翻译…")
+                                Text("正在生成最终译文…")
                             }
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                         } else {
-                            Text(segment.translatedText).fontWeight(.medium)
+                            Text(segment.translatedText)
+                                .font(.title3.weight(.semibold))
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -285,17 +350,28 @@ struct ContentView: View {
                 }
 
                 if !model.partialTranscript.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            Label("正在听", systemImage: "waveform")
+                                .font(.caption.bold())
+                                .foregroundStyle(.cyan)
+                            Spacer()
+                            if model.translationQuality == .lowLatency {
+                                Text("稳定片段预览")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
                         Text(model.partialTranscript)
                             .foregroundStyle(.secondary)
                             .italic()
                         if !model.partialTranslation.isEmpty {
                             Text(model.partialTranslation)
                                 .fontWeight(.medium)
-                        } else if model.lowLatencyTranslation {
+                        } else if model.translationQuality == .lowLatency {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.small)
-                                Text("实时翻译中…")
+                                Text("等待稳定片段…")
                             }
                             .font(.caption)
                             .foregroundStyle(.tertiary)
@@ -367,7 +443,7 @@ struct ContentView: View {
     private var privacyCard: some View {
         VStack(alignment: .leading, spacing: 7) {
             Label("离线与隐私", systemImage: "lock.shield").font(.headline)
-            Text("语音识别和系统 Translation 翻译走 Apple 设备端框架；首次使用语言需要下载资源。Qwen3 离线 AI 只在首次下载模型时联网，模型加载后总结在设备本机运行。会话记录保存到本机 Documents。")
+            Text("语音识别和系统 Translation 翻译走 Apple 设备端框架；首次使用语言需要下载资源。本机语音由 AVSpeechSynthesizer 朗读。Qwen3 离线 AI 只在首次下载模型时联网，模型加载后总结在设备本机运行。会话记录保存到本机 Documents。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

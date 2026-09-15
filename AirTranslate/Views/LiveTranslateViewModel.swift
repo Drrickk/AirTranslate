@@ -16,9 +16,12 @@ final class LiveTranslateViewModel: ObservableObject {
     @Published var autoSpeakTranslation = true
     @Published var speakMyTranslationOnSpeaker = true
     @Published var preferBluetoothMic = false
-    @Published var lowLatencyTranslation = true
+    @Published var translationQuality: TranslationQualityMode = .lowLatency
+    @Published var lowLatencySpeech = true
     @Published var adaptiveSpeechCatchUp = true
     @Published var speechBaseRate: Double = 0.58
+    @Published var voiceOptions: [LocalVoiceOption] = []
+    @Published var selectedVoiceIdentifier = ""
     @Published var summaryText = ""
     @Published var summaryMode = ""
     @Published var summaryEngine: SummaryEngineChoice = .automatic
@@ -34,16 +37,22 @@ final class LiveTranslateViewModel: ObservableObject {
     private let summaryService = SummaryService()
     private let store = ConversationStore()
 
-    private var partialThrottleTask: Task<Void, Never>?
+    private var partialPreviewTask: Task<Void, Never>?
+    private var speechStabilityTask: Task<Void, Never>?
     private var latestPartialRequestID: UUID?
     private var lastPreviewedText = ""
     private var forwardPreviewInFlight = false
     private var reversePreviewInFlight = false
+    private var partialHistory: [String] = []
+    private var spokenSourcePrefix = ""
+    private var voiceSelectionLanguageID = ""
+    private var voiceByLanguage: [String: String] = [:]
 
     init() {
         if let phase = SpeechCaptureService.lastStartupPhase {
             statusMessage = "上次启动停在：\(phase)"
         }
+        refreshVoiceOptions()
     }
 
     var currentInputLanguage: AppLanguage {
@@ -54,6 +63,10 @@ final class LiveTranslateViewModel: ObservableObject {
     var currentOutputLanguage: AppLanguage {
         if mode == .conversation && activeSide == .me { return sourceLanguage }
         return targetLanguage
+    }
+
+    var usesLowLatencyTranslation: Bool {
+        translationQuality == .lowLatency
     }
 
     var fullTranscriptForSummary: String {
@@ -83,7 +96,7 @@ final class LiveTranslateViewModel: ObservableObject {
     private func startListeningTask() async {
         summaryText = ""
         summaryMode = ""
-        partialTranslation = ""
+        resetPartialState(clearVisibleText: true)
         statusMessage = "正在启动设备端语音识别…"
         let inputLanguage = currentInputLanguage
         let outputLanguage = currentOutputLanguage
@@ -103,7 +116,7 @@ final class LiveTranslateViewModel: ObservableObject {
                 }
             )
             isListening = true
-            statusMessage = "低延迟离线同传 · \(inputLanguage.name) → \(outputLanguage.name)"
+            statusMessage = "设备端同传 · \(inputLanguage.name) → \(outputLanguage.name)"
             routeMessage = await captureService.currentRouteDescription()
         } catch {
             isListening = false
@@ -114,9 +127,7 @@ final class LiveTranslateViewModel: ObservableObject {
     func stopListening() {
         guard isListening else { return }
         isListening = false
-        cancelPartialPreview()
-        partialTranscript = ""
-        partialTranslation = ""
+        resetPartialState(clearVisibleText: true)
         speechOutput.stop()
         statusMessage = "已停止"
         Task { await captureService.stop() }
@@ -126,9 +137,7 @@ final class LiveTranslateViewModel: ObservableObject {
         guard mode == .conversation, side != activeSide else { return }
         let shouldResume = isListening
         isListening = false
-        cancelPartialPreview()
-        partialTranscript = ""
-        partialTranslation = ""
+        resetPartialState(clearVisibleText: true)
         speechOutput.stop()
         Task {
             await captureService.stop()
@@ -144,15 +153,36 @@ final class LiveTranslateViewModel: ObservableObject {
         sourceLanguage = targetLanguage
         targetLanguage = oldSource
         partialTranslation = ""
+        refreshVoiceOptions()
         statusMessage = "已切换语言"
     }
 
+    func translationQualityChanged() {
+        resetPartialState(clearVisibleText: false)
+        if translationQuality == .highQuality {
+            partialTranslation = ""
+        }
+    }
+
+    func refreshVoiceOptions() {
+        if !voiceSelectionLanguageID.isEmpty {
+            voiceByLanguage[voiceSelectionLanguageID] = selectedVoiceIdentifier
+        }
+
+        voiceSelectionLanguageID = targetLanguage.id
+        voiceOptions = speechOutput.availableVoices(languageCode: targetLanguage.speechLocaleIdentifier)
+        let saved = voiceByLanguage[targetLanguage.id] ?? ""
+        if saved.isEmpty || voiceOptions.contains(where: { $0.id == saved }) {
+            selectedVoiceIdentifier = saved
+        } else {
+            selectedVoiceIdentifier = ""
+        }
+    }
+
     func clearConversation() {
-        stopListening()
+        if isListening { stopListening() } else { speechOutput.stop() }
         segments.removeAll()
-        cancelPartialPreview()
-        partialTranscript = ""
-        partialTranslation = ""
+        resetPartialState(clearVisibleText: true)
         summaryText = ""
         summaryMode = ""
         statusMessage = "已清空"
@@ -179,60 +209,48 @@ final class LiveTranslateViewModel: ObservableObject {
         let cleanTranslation = translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTranslation.isEmpty else { return }
 
-        if request.purpose == .preview {
+        switch request.purpose {
+        case .preview:
             markPreviewFinished(direction: request.direction)
-            if lowLatencyTranslation,
+            if usesLowLatencyTranslation,
                latestPartialRequestID == request.id,
-               request.text == partialTranscript {
+               partialTranscript.hasPrefix(request.text) {
                 partialTranslation = cleanTranslation
             }
             scheduleAnotherPreviewIfNeeded(after: request.text)
-            return
-        }
 
-        guard let segmentID = request.segmentID,
-              let index = segments.firstIndex(where: { $0.id == segmentID }) else { return }
-        segments[index].translatedText = cleanTranslation
+        case .speechChunk:
+            if request.speakAfterTranslation {
+                speakTranslation(cleanTranslation, request: request)
+            }
 
-        guard autoSpeakTranslation else { return }
-        if request.direction == .reverse && mode == .conversation && speakMyTranslationOnSpeaker {
-            if isListening { stopListening() }
-            _ = speechOutput.speak(
-                cleanTranslation,
-                languageCode: request.targetLanguage.speechLocaleIdentifier,
-                route: .speaker,
-                baseRate: Float(speechBaseRate),
-                adaptiveCatchUp: adaptiveSpeechCatchUp
-            )
-            statusMessage = "已外放译文；可点“对方说”继续"
-        } else {
-            if let decision = speechOutput.speak(
-                cleanTranslation,
-                languageCode: request.targetLanguage.speechLocaleIdentifier,
-                route: .current,
-                baseRate: Float(speechBaseRate),
-                adaptiveCatchUp: adaptiveSpeechCatchUp
-            ), decision.resynced {
-                statusMessage = "语音已追赶到最新译文 · 当前语速 \(String(format: "%.2f", decision.rate))"
+        case .final:
+            guard let segmentID = request.segmentID,
+                  let index = segments.firstIndex(where: { $0.id == segmentID }) else { return }
+            segments[index].translatedText = cleanTranslation
+            if request.speakAfterTranslation {
+                speakTranslation(cleanTranslation, request: request)
             }
         }
     }
 
     func translationFailed(request: TranslationRequest, error: Error) {
-        if request.purpose == .preview {
+        switch request.purpose {
+        case .preview:
             markPreviewFinished(direction: request.direction)
             if latestPartialRequestID == request.id {
                 partialTranslation = ""
             }
             scheduleAnotherPreviewIfNeeded(after: request.text)
-            return
+        case .speechChunk:
+            statusMessage = "低延迟朗读片段翻译失败，等待最终译文"
+        case .final:
+            if let segmentID = request.segmentID,
+               let index = segments.firstIndex(where: { $0.id == segmentID }) {
+                segments[index].translatedText = "翻译失败：\(error.localizedDescription)"
+            }
+            statusMessage = "翻译失败，请确认系统翻译语言包已下载"
         }
-
-        if let segmentID = request.segmentID,
-           let index = segments.firstIndex(where: { $0.id == segmentID }) {
-            segments[index].translatedText = "翻译失败：\(error.localizedDescription)"
-        }
-        statusMessage = "翻译失败，请确认系统翻译语言包已下载"
     }
 
     func summarize() {
@@ -317,69 +335,56 @@ final class LiveTranslateViewModel: ObservableObject {
         partialTranscript = clean
 
         guard !clean.isEmpty else {
-            cancelPartialPreview()
+            resetPartialState(clearVisibleText: false)
             partialTranslation = ""
             return
         }
 
-        guard lowLatencyTranslation else {
+        partialHistory.append(clean)
+        if partialHistory.count > 3 {
+            partialHistory.removeFirst(partialHistory.count - 3)
+        }
+
+        guard usesLowLatencyTranslation else {
             partialTranslation = ""
             return
         }
 
-        // Throttle rather than debounce: keep translating during continuous speech,
-        // but coalesce many SpeechTranscriber partial updates into roughly one
-        // request every 300 ms. At most one preview per direction may be in flight,
-        // so preview work can never build an unbounded queue in front of a final sentence.
-        schedulePartialPreview()
-    }
-
-    private func enqueueLatestPartialPreviewIfNeeded() {
-        let clean = partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard lowLatencyTranslation,
-              clean.count >= 3,
-              clean != lastPreviewedText else { return }
-
-        let direction: TranslationDirection = (mode == .conversation && activeSide == .me) ? .reverse : .forward
-        if direction == .forward, forwardPreviewInFlight { return }
-        if direction == .reverse, reversePreviewInFlight { return }
-        lastPreviewedText = clean
-
-        let source = direction == .forward ? sourceLanguage : targetLanguage
-        let target = direction == .forward ? targetLanguage : sourceLanguage
-        let request = TranslationRequest(
-            id: UUID(),
-            segmentID: nil,
-            text: clean,
-            direction: direction,
-            sourceLanguage: source,
-            targetLanguage: target,
-            purpose: .preview
-        )
-        latestPartialRequestID = request.id
-
-        if direction == .forward {
-            forwardPreviewInFlight = true
-            forwardTranslationPipe.send(request)
-        } else {
-            reversePreviewInFlight = true
-            reverseTranslationPipe.send(request)
-        }
+        scheduleStablePreview()
+        scheduleLowLatencySpeechIfNeeded(for: clean)
     }
 
     private func receiveFinalTranscript(_ text: String) {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
 
-        cancelPartialPreview()
-        partialTranscript = ""
-        partialTranslation = ""
+        partialPreviewTask?.cancel()
+        partialPreviewTask = nil
+        speechStabilityTask?.cancel()
+        speechStabilityTask = nil
+        latestPartialRequestID = nil
         lastPreviewedText = ""
+        forwardPreviewInFlight = false
+        reversePreviewInFlight = false
 
-        let direction: TranslationDirection = (mode == .conversation && activeSide == .me) ? .reverse : .forward
+        let direction = currentDirection
         let source = direction == .forward ? sourceLanguage : targetLanguage
         let target = direction == .forward ? targetLanguage : sourceLanguage
         let speaker: ConversationSpeaker? = mode == .conversation ? (direction == .forward ? .other : .me) : nil
+
+        var finalShouldSpeak = autoSpeakTranslation
+        if usesLowLatencyTranslation && lowLatencySpeech && autoSpeakTranslation && !spokenSourcePrefix.isEmpty {
+            if clean.hasPrefix(spokenSourcePrefix) {
+                let remainder = String(clean.dropFirst(spokenSourcePrefix.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if isUsefulSpeechChunk(remainder) {
+                    sendSpeechChunk(remainder, direction: direction, source: source, target: target)
+                }
+            } else {
+                statusMessage = "识别结果发生修正；已避免重复朗读，屏幕以最终译文为准"
+            }
+            finalShouldSpeak = false
+        }
 
         let segment = ConversationSegment(
             sourceText: clean,
@@ -389,58 +394,256 @@ final class LiveTranslateViewModel: ObservableObject {
         )
         segments.append(segment)
 
-        let request = TranslationRequest(
+        let finalRequest = TranslationRequest(
             id: UUID(),
             segmentID: segment.id,
             text: clean,
             direction: direction,
             sourceLanguage: source,
             targetLanguage: target,
-            purpose: .final
+            purpose: .final,
+            speakAfterTranslation: finalShouldSpeak
         )
+        send(finalRequest)
 
-        if direction == .forward {
-            forwardTranslationPipe.send(request)
-        } else {
-            reverseTranslationPipe.send(request)
-        }
+        partialTranscript = ""
+        partialTranslation = ""
+        partialHistory.removeAll()
+        spokenSourcePrefix = ""
     }
 
-    private func schedulePartialPreview(delayNanoseconds: UInt64 = 300_000_000) {
-        guard lowLatencyTranslation, partialThrottleTask == nil else { return }
-        partialThrottleTask = Task { [weak self] in
+    private func scheduleStablePreview(delayNanoseconds: UInt64 = 240_000_000) {
+        guard usesLowLatencyTranslation, partialPreviewTask == nil else { return }
+        partialPreviewTask = Task { [weak self] in
             do {
                 try await Task.sleep(nanoseconds: delayNanoseconds)
             } catch {
                 return
             }
             guard let self, !Task.isCancelled else { return }
-            self.partialThrottleTask = nil
-            self.enqueueLatestPartialPreviewIfNeeded()
+            self.partialPreviewTask = nil
+            self.enqueueStablePartialPreviewIfNeeded()
         }
+    }
+
+    private func enqueueStablePartialPreviewIfNeeded() {
+        guard usesLowLatencyTranslation,
+              let candidate = stablePreviewCandidate(),
+              candidate != lastPreviewedText else { return }
+
+        let direction = currentDirection
+        if direction == .forward, forwardPreviewInFlight { return }
+        if direction == .reverse, reversePreviewInFlight { return }
+
+        let source = direction == .forward ? sourceLanguage : targetLanguage
+        let target = direction == .forward ? targetLanguage : sourceLanguage
+        let request = TranslationRequest(
+            id: UUID(),
+            segmentID: nil,
+            text: candidate,
+            direction: direction,
+            sourceLanguage: source,
+            targetLanguage: target,
+            purpose: .preview,
+            speakAfterTranslation: false
+        )
+
+        lastPreviewedText = candidate
+        latestPartialRequestID = request.id
+        if direction == .forward { forwardPreviewInFlight = true }
+        else { reversePreviewInFlight = true }
+        send(request)
+    }
+
+    private func stablePreviewCandidate() -> String? {
+        let current = partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !current.isEmpty else { return nil }
+
+        if hasStrongEnding(current), isUsefulPreview(current) {
+            return current
+        }
+
+        guard partialHistory.count >= 2 else { return nil }
+        let previous = partialHistory[partialHistory.count - 2]
+        var prefix = longestCommonPrefix(previous, current)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !prefix.isEmpty else { return nil }
+
+        // For space-delimited languages, avoid translating the middle of a word.
+        if usesSpaceDelimitedWords(currentInputLanguage),
+           !hasStrongEnding(prefix),
+           prefix.count < current.count,
+           let lastSpace = prefix.lastIndex(of: " ") {
+            prefix = String(prefix[..<lastSpace]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return isUsefulPreview(prefix) ? prefix : nil
+    }
+
+    private func scheduleLowLatencySpeechIfNeeded(for capturedText: String) {
+        speechStabilityTask?.cancel()
+        guard lowLatencySpeech,
+              autoSpeakTranslation,
+              usesLowLatencyTranslation else { return }
+
+        let delay: UInt64 = hasStrongEnding(capturedText) ? 180_000_000 : 520_000_000
+        speechStabilityTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled,
+                  self.partialTranscript == capturedText else { return }
+            self.commitStableSpeechChunk(capturedText)
+        }
+    }
+
+    private func commitStableSpeechChunk(_ capturedText: String) {
+        guard capturedText.hasPrefix(spokenSourcePrefix) else { return }
+        let remainder = String(capturedText.dropFirst(spokenSourcePrefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isUsefulSpeechChunk(remainder) else { return }
+
+        let direction = currentDirection
+        let source = direction == .forward ? sourceLanguage : targetLanguage
+        let target = direction == .forward ? targetLanguage : sourceLanguage
+
+        // Mark before enqueueing so a later partial cannot enqueue the same words twice.
+        spokenSourcePrefix = capturedText
+        sendSpeechChunk(remainder, direction: direction, source: source, target: target)
+    }
+
+    private func sendSpeechChunk(
+        _ text: String,
+        direction: TranslationDirection,
+        source: AppLanguage,
+        target: AppLanguage
+    ) {
+        let request = TranslationRequest(
+            id: UUID(),
+            segmentID: nil,
+            text: text,
+            direction: direction,
+            sourceLanguage: source,
+            targetLanguage: target,
+            purpose: .speechChunk,
+            speakAfterTranslation: true
+        )
+        send(request)
+    }
+
+    private func send(_ request: TranslationRequest) {
+        if request.direction == .forward {
+            forwardTranslationPipe.send(request)
+        } else {
+            reverseTranslationPipe.send(request)
+        }
+    }
+
+    private var currentDirection: TranslationDirection {
+        (mode == .conversation && activeSide == .me) ? .reverse : .forward
     }
 
     private func markPreviewFinished(direction: TranslationDirection) {
-        if direction == .forward {
-            forwardPreviewInFlight = false
-        } else {
-            reversePreviewInFlight = false
-        }
+        if direction == .forward { forwardPreviewInFlight = false }
+        else { reversePreviewInFlight = false }
     }
 
     private func scheduleAnotherPreviewIfNeeded(after translatedSource: String) {
-        guard lowLatencyTranslation,
+        guard usesLowLatencyTranslation,
               !partialTranscript.isEmpty,
-              partialTranscript != translatedSource else { return }
-        // A short follow-up delay catches the newest accumulated partial without
-        // hammering TranslationSession while it is still busy.
-        schedulePartialPreview(delayNanoseconds: 120_000_000)
+              stablePreviewCandidate() != translatedSource else { return }
+        scheduleStablePreview(delayNanoseconds: 140_000_000)
     }
 
-    private func cancelPartialPreview() {
-        partialThrottleTask?.cancel()
-        partialThrottleTask = nil
+    private func speakTranslation(_ text: String, request: TranslationRequest) {
+        guard autoSpeakTranslation else { return }
+
+        let selectedVoice: String?
+        if request.direction == .forward,
+           request.targetLanguage.id == voiceSelectionLanguageID,
+           !selectedVoiceIdentifier.isEmpty {
+            selectedVoice = selectedVoiceIdentifier
+        } else {
+            selectedVoice = nil
+        }
+
+        if request.direction == .reverse && mode == .conversation && speakMyTranslationOnSpeaker {
+            if isListening { stopListening() }
+            _ = speechOutput.speak(
+                text,
+                languageCode: request.targetLanguage.speechLocaleIdentifier,
+                voiceIdentifier: selectedVoice,
+                route: .speaker,
+                baseRate: Float(speechBaseRate),
+                adaptiveCatchUp: adaptiveSpeechCatchUp
+            )
+            statusMessage = "已外放译文；可点“对方说”继续"
+            return
+        }
+
+        if let decision = speechOutput.speak(
+            text,
+            languageCode: request.targetLanguage.speechLocaleIdentifier,
+            voiceIdentifier: selectedVoice,
+            route: .current,
+            baseRate: Float(speechBaseRate),
+            adaptiveCatchUp: adaptiveSpeechCatchUp
+        ), decision.resynced {
+            statusMessage = "语音已追赶到最新译文 · 当前语速 \(String(format: "%.2f", decision.rate))"
+        }
+    }
+
+    private func resetPartialState(clearVisibleText: Bool) {
+        partialPreviewTask?.cancel()
+        partialPreviewTask = nil
+        speechStabilityTask?.cancel()
+        speechStabilityTask = nil
         latestPartialRequestID = nil
         lastPreviewedText = ""
+        forwardPreviewInFlight = false
+        reversePreviewInFlight = false
+        partialHistory.removeAll()
+        spokenSourcePrefix = ""
+        if clearVisibleText {
+            partialTranscript = ""
+            partialTranslation = ""
+        }
+    }
+
+    private func longestCommonPrefix(_ lhs: String, _ rhs: String) -> String {
+        var left = lhs.makeIterator()
+        var right = rhs.makeIterator()
+        var output = ""
+        while let a = left.next(), let b = right.next(), a == b {
+            output.append(a)
+        }
+        return output
+    }
+
+    private func hasStrongEnding(_ text: String) -> Bool {
+        guard let last = text.trimmingCharacters(in: .whitespacesAndNewlines).last else { return false }
+        return ".!?。！？；;：:".contains(last)
+    }
+
+    private func usesSpaceDelimitedWords(_ language: AppLanguage) -> Bool {
+        ["en", "fr", "de", "es"].contains(language.id)
+    }
+
+    private func isUsefulPreview(_ text: String) -> Bool {
+        if usesSpaceDelimitedWords(currentInputLanguage) {
+            return text.split(whereSeparator: { $0.isWhitespace }).count >= 3
+        }
+        return text.count >= 4
+    }
+
+    private func isUsefulSpeechChunk(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        if usesSpaceDelimitedWords(currentInputLanguage) {
+            return text.split(whereSeparator: { $0.isWhitespace }).count >= 2 || hasStrongEnding(text)
+        }
+        return text.count >= 3 || hasStrongEnding(text)
     }
 }
