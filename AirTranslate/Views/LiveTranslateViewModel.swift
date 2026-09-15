@@ -9,27 +9,36 @@ final class LiveTranslateViewModel: ObservableObject {
     @Published var activeSide: ConversationSide = .other
     @Published var isListening = false
     @Published var partialTranscript = ""
+    @Published var partialTranslation = ""
     @Published var segments: [ConversationSegment] = []
     @Published var statusMessage = "准备就绪"
     @Published var routeMessage = ""
     @Published var autoSpeakTranslation = true
     @Published var speakMyTranslationOnSpeaker = true
     @Published var preferBluetoothMic = false
+    @Published var lowLatencyTranslation = true
+    @Published var adaptiveSpeechCatchUp = true
+    @Published var speechBaseRate: Double = 0.58
     @Published var summaryText = ""
     @Published var summaryMode = ""
     @Published var summaryEngine: SummaryEngineChoice = .automatic
     @Published var isSummarizing = false
     @Published var summaryProgress: Double?
     @Published var history: [SavedConversation] = []
-    @Published private(set) var forwardTranslationVersion = 0
-    @Published private(set) var reverseTranslationVersion = 0
+
+    let forwardTranslationPipe = TranslationRequestPipe()
+    let reverseTranslationPipe = TranslationRequestPipe()
 
     private let captureService = SpeechCaptureService()
     private let speechOutput = SpeechOutputService()
     private let summaryService = SummaryService()
     private let store = ConversationStore()
-    private var forwardQueue: [TranslationRequest] = []
-    private var reverseQueue: [TranslationRequest] = []
+
+    private var partialThrottleTask: Task<Void, Never>?
+    private var latestPartialRequestID: UUID?
+    private var lastPreviewedText = ""
+    private var forwardPreviewInFlight = false
+    private var reversePreviewInFlight = false
 
     init() {
         if let phase = SpeechCaptureService.lastStartupPhase {
@@ -74,6 +83,7 @@ final class LiveTranslateViewModel: ObservableObject {
     private func startListeningTask() async {
         summaryText = ""
         summaryMode = ""
+        partialTranslation = ""
         statusMessage = "正在启动设备端语音识别…"
         let inputLanguage = currentInputLanguage
         let outputLanguage = currentOutputLanguage
@@ -83,7 +93,7 @@ final class LiveTranslateViewModel: ObservableObject {
                 localeIdentifier: inputLanguage.speechLocaleIdentifier,
                 preferBluetoothMic: preferBluetoothMic,
                 onPartial: { [weak self] text in
-                    await MainActor.run { self?.partialTranscript = text }
+                    await MainActor.run { self?.receivePartialTranscript(text) }
                 },
                 onFinal: { [weak self] text in
                     await MainActor.run { self?.receiveFinalTranscript(text) }
@@ -93,7 +103,7 @@ final class LiveTranslateViewModel: ObservableObject {
                 }
             )
             isListening = true
-            statusMessage = "正在离线识别 · \(inputLanguage.name) → \(outputLanguage.name)"
+            statusMessage = "低延迟离线同传 · \(inputLanguage.name) → \(outputLanguage.name)"
             routeMessage = await captureService.currentRouteDescription()
         } catch {
             isListening = false
@@ -104,7 +114,9 @@ final class LiveTranslateViewModel: ObservableObject {
     func stopListening() {
         guard isListening else { return }
         isListening = false
+        cancelPartialPreview()
         partialTranscript = ""
+        partialTranslation = ""
         speechOutput.stop()
         statusMessage = "已停止"
         Task { await captureService.stop() }
@@ -114,7 +126,9 @@ final class LiveTranslateViewModel: ObservableObject {
         guard mode == .conversation, side != activeSide else { return }
         let shouldResume = isListening
         isListening = false
+        cancelPartialPreview()
         partialTranscript = ""
+        partialTranslation = ""
         speechOutput.stop()
         Task {
             await captureService.stop()
@@ -129,14 +143,16 @@ final class LiveTranslateViewModel: ObservableObject {
         let oldSource = sourceLanguage
         sourceLanguage = targetLanguage
         targetLanguage = oldSource
+        partialTranslation = ""
         statusMessage = "已切换语言"
     }
 
     func clearConversation() {
         stopListening()
         segments.removeAll()
-        forwardQueue.removeAll()
-        reverseQueue.removeAll()
+        cancelPartialPreview()
+        partialTranscript = ""
+        partialTranslation = ""
         summaryText = ""
         summaryMode = ""
         statusMessage = "已清空"
@@ -159,40 +175,61 @@ final class LiveTranslateViewModel: ObservableObject {
         }
     }
 
-    func dequeueForwardTranslation() -> TranslationRequest? {
-        guard !forwardQueue.isEmpty else { return nil }
-        return forwardQueue.removeFirst()
-    }
-
-    func dequeueReverseTranslation() -> TranslationRequest? {
-        guard !reverseQueue.isEmpty else { return nil }
-        return reverseQueue.removeFirst()
-    }
-
     func completeTranslation(request: TranslationRequest, translatedText: String) {
-        guard let index = segments.firstIndex(where: { $0.id == request.segmentID }) else { return }
-        segments[index].translatedText = translatedText
+        let cleanTranslation = translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanTranslation.isEmpty else { return }
+
+        if request.purpose == .preview {
+            markPreviewFinished(direction: request.direction)
+            if lowLatencyTranslation,
+               latestPartialRequestID == request.id,
+               request.text == partialTranscript {
+                partialTranslation = cleanTranslation
+            }
+            scheduleAnotherPreviewIfNeeded(after: request.text)
+            return
+        }
+
+        guard let segmentID = request.segmentID,
+              let index = segments.firstIndex(where: { $0.id == segmentID }) else { return }
+        segments[index].translatedText = cleanTranslation
 
         guard autoSpeakTranslation else { return }
         if request.direction == .reverse && mode == .conversation && speakMyTranslationOnSpeaker {
             if isListening { stopListening() }
-            speechOutput.speak(
-                translatedText,
+            _ = speechOutput.speak(
+                cleanTranslation,
                 languageCode: request.targetLanguage.speechLocaleIdentifier,
-                route: .speaker
+                route: .speaker,
+                baseRate: Float(speechBaseRate),
+                adaptiveCatchUp: adaptiveSpeechCatchUp
             )
             statusMessage = "已外放译文；可点“对方说”继续"
         } else {
-            speechOutput.speak(
-                translatedText,
+            if let decision = speechOutput.speak(
+                cleanTranslation,
                 languageCode: request.targetLanguage.speechLocaleIdentifier,
-                route: .current
-            )
+                route: .current,
+                baseRate: Float(speechBaseRate),
+                adaptiveCatchUp: adaptiveSpeechCatchUp
+            ), decision.resynced {
+                statusMessage = "语音已追赶到最新译文 · 当前语速 \(String(format: "%.2f", decision.rate))"
+            }
         }
     }
 
     func translationFailed(request: TranslationRequest, error: Error) {
-        if let index = segments.firstIndex(where: { $0.id == request.segmentID }) {
+        if request.purpose == .preview {
+            markPreviewFinished(direction: request.direction)
+            if latestPartialRequestID == request.id {
+                partialTranslation = ""
+            }
+            scheduleAnotherPreviewIfNeeded(after: request.text)
+            return
+        }
+
+        if let segmentID = request.segmentID,
+           let index = segments.firstIndex(where: { $0.id == segmentID }) {
             segments[index].translatedText = "翻译失败：\(error.localizedDescription)"
         }
         statusMessage = "翻译失败，请确认系统翻译语言包已下载"
@@ -275,9 +312,69 @@ final class LiveTranslateViewModel: ObservableObject {
         ).exportText
     }
 
+    private func receivePartialTranscript(_ text: String) {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        partialTranscript = clean
+
+        guard !clean.isEmpty else {
+            cancelPartialPreview()
+            partialTranslation = ""
+            return
+        }
+
+        guard lowLatencyTranslation else {
+            partialTranslation = ""
+            return
+        }
+
+        // Throttle rather than debounce: keep translating during continuous speech,
+        // but coalesce many SpeechTranscriber partial updates into roughly one
+        // request every 300 ms. At most one preview per direction may be in flight,
+        // so preview work can never build an unbounded queue in front of a final sentence.
+        schedulePartialPreview()
+    }
+
+    private func enqueueLatestPartialPreviewIfNeeded() {
+        let clean = partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard lowLatencyTranslation,
+              clean.count >= 3,
+              clean != lastPreviewedText else { return }
+
+        let direction: TranslationDirection = (mode == .conversation && activeSide == .me) ? .reverse : .forward
+        if direction == .forward, forwardPreviewInFlight { return }
+        if direction == .reverse, reversePreviewInFlight { return }
+        lastPreviewedText = clean
+
+        let source = direction == .forward ? sourceLanguage : targetLanguage
+        let target = direction == .forward ? targetLanguage : sourceLanguage
+        let request = TranslationRequest(
+            id: UUID(),
+            segmentID: nil,
+            text: clean,
+            direction: direction,
+            sourceLanguage: source,
+            targetLanguage: target,
+            purpose: .preview
+        )
+        latestPartialRequestID = request.id
+
+        if direction == .forward {
+            forwardPreviewInFlight = true
+            forwardTranslationPipe.send(request)
+        } else {
+            reversePreviewInFlight = true
+            reverseTranslationPipe.send(request)
+        }
+    }
+
     private func receiveFinalTranscript(_ text: String) {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
+
+        cancelPartialPreview()
+        partialTranscript = ""
+        partialTranslation = ""
+        lastPreviewedText = ""
 
         let direction: TranslationDirection = (mode == .conversation && activeSide == .me) ? .reverse : .forward
         let source = direction == .forward ? sourceLanguage : targetLanguage
@@ -298,15 +395,52 @@ final class LiveTranslateViewModel: ObservableObject {
             text: clean,
             direction: direction,
             sourceLanguage: source,
-            targetLanguage: target
+            targetLanguage: target,
+            purpose: .final
         )
 
         if direction == .forward {
-            forwardQueue.append(request)
-            forwardTranslationVersion += 1
+            forwardTranslationPipe.send(request)
         } else {
-            reverseQueue.append(request)
-            reverseTranslationVersion += 1
+            reverseTranslationPipe.send(request)
         }
+    }
+
+    private func schedulePartialPreview(delayNanoseconds: UInt64 = 300_000_000) {
+        guard lowLatencyTranslation, partialThrottleTask == nil else { return }
+        partialThrottleTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.partialThrottleTask = nil
+            self.enqueueLatestPartialPreviewIfNeeded()
+        }
+    }
+
+    private func markPreviewFinished(direction: TranslationDirection) {
+        if direction == .forward {
+            forwardPreviewInFlight = false
+        } else {
+            reversePreviewInFlight = false
+        }
+    }
+
+    private func scheduleAnotherPreviewIfNeeded(after translatedSource: String) {
+        guard lowLatencyTranslation,
+              !partialTranscript.isEmpty,
+              partialTranscript != translatedSource else { return }
+        // A short follow-up delay catches the newest accumulated partial without
+        // hammering TranslationSession while it is still busy.
+        schedulePartialPreview(delayNanoseconds: 120_000_000)
+    }
+
+    private func cancelPartialPreview() {
+        partialThrottleTask?.cancel()
+        partialThrottleTask = nil
+        latestPartialRequestID = nil
+        lastPreviewedText = ""
     }
 }

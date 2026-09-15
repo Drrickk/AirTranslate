@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 @preconcurrency import Translation
 
@@ -58,12 +59,13 @@ struct ContentView: View {
         }
         .onChange(of: model.sourceLanguage) { _, _ in resetTranslationConfigurations() }
         .onChange(of: model.targetLanguage) { _, _ in resetTranslationConfigurations() }
-        .onChange(of: model.forwardTranslationVersion) { _, _ in forwardConfiguration?.invalidate() }
-        .onChange(of: model.reverseTranslationVersion) { _, _ in reverseConfiguration?.invalidate() }
         .translationTask(forwardConfiguration) { session in
             do {
+                // Warm once and keep this TranslationSession alive for the entire
+                // listening session. Do not invalidate/re-prepare for every sentence.
                 try await session.prepareTranslation()
-                while let request = model.dequeueForwardTranslation() {
+                for await request in model.forwardTranslationPipe.stream {
+                    if Task.isCancelled { break }
                     do {
                         let response = try await session.translate(request.text)
                         model.completeTranslation(request: request, translatedText: response.targetText)
@@ -78,7 +80,8 @@ struct ContentView: View {
         .translationTask(reverseConfiguration) { session in
             do {
                 try await session.prepareTranslation()
-                while let request = model.dequeueReverseTranslation() {
+                for await request in model.reverseTranslationPipe.stream {
+                    if Task.isCancelled { break }
                     do {
                         let response = try await session.translate(request.text)
                         model.completeTranslation(request: request, translatedText: response.targetText)
@@ -200,7 +203,22 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
 
+            Toggle("低延迟实时翻译", isOn: $model.lowLatencyTranslation)
+
             Toggle("自动朗读译文", isOn: $model.autoSpeakTranslation)
+            if model.autoSpeakTranslation {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("基础朗读速度")
+                        Spacer()
+                        Text(String(format: "%.2f", model.speechBaseRate))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $model.speechBaseRate, in: 0.50...0.65, step: 0.01)
+                    Toggle("语音自动追赶，避免越听越落后", isOn: $model.adaptiveSpeechCatchUp)
+                }
+            }
             if model.mode == .conversation {
                 Toggle("我说中文后，把外语译文从 iPhone 外放", isOn: $model.speakMyTranslationOnSpeaker)
                     .disabled(!model.autoSpeakTranslation)
@@ -267,12 +285,25 @@ struct ContentView: View {
                 }
 
                 if !model.partialTranscript.isEmpty {
-                    Text(model.partialTranscript)
-                        .foregroundStyle(.secondary)
-                        .italic()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(model.partialTranscript)
+                            .foregroundStyle(.secondary)
+                            .italic()
+                        if !model.partialTranslation.isEmpty {
+                            Text(model.partialTranslation)
+                                .fontWeight(.medium)
+                        } else if model.lowLatencyTranslation {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("实时翻译中…")
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
                 }
             }
         }

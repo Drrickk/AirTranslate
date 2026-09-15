@@ -28,11 +28,35 @@ struct ConversationSegment: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+enum TranslationRequestPurpose: Hashable, Sendable {
+    case preview
+    case final
+}
+
 struct TranslationRequest: Identifiable, Hashable, Sendable {
     let id: UUID
-    let segmentID: UUID
+    let segmentID: UUID?
     let text: String
     let direction: TranslationDirection
     let sourceLanguage: AppLanguage
     let targetLanguage: AppLanguage
+    let purpose: TranslationRequestPurpose
+}
+
+/// Thread-safe bridge between the MainActor view model and SwiftUI's long-lived
+/// TranslationSession task. Preview requests are coalesced by the view model,
+/// while final requests are always retained in this stream.
+final class TranslationRequestPipe: @unchecked Sendable {
+    let stream: AsyncStream<TranslationRequest>
+    private let continuation: AsyncStream<TranslationRequest>.Continuation
+
+    init() {
+        let pair = AsyncStream<TranslationRequest>.makeStream(bufferingPolicy: .unbounded)
+        stream = pair.stream
+        continuation = pair.continuation
+    }
+
+    func send(_ request: TranslationRequest) {
+        continuation.yield(request)
+    }
 }
