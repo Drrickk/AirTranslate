@@ -6,6 +6,7 @@ struct ContentView: View {
     @StateObject private var model = LiveTranslateViewModel()
     @State private var forwardConfiguration: TranslationSession.Configuration?
     @State private var reverseConfiguration: TranslationSession.Configuration?
+    @State private var showingAISettings = false
 
     var body: some View {
         NavigationStack {
@@ -68,6 +69,9 @@ struct ContentView: View {
         }
         .onChange(of: model.translationQuality) { _, _ in
             model.translationQualityChanged()
+        }
+        .sheet(isPresented: $showingAISettings) {
+            AISummarySettingsView(model: model)
         }
         .translationTask(forwardConfiguration) { session in
             do {
@@ -389,26 +393,78 @@ struct ContentView: View {
     private var summaryCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label("会话总结", systemImage: "sparkles").font(.headline)
+                Label("AI 总结", systemImage: "sparkles").font(.headline)
                 Spacer()
                 if !model.summaryMode.isEmpty {
                     Text(model.summaryMode).font(.caption).foregroundStyle(.secondary)
                 }
             }
 
-            Picker("总结引擎", selection: $model.summaryEngine) {
+            Picker("服务商", selection: $model.summaryEngine) {
                 ForEach(SummaryEngineChoice.allCases) { engine in
                     Text(engine.rawValue).tag(engine)
                 }
             }
             .pickerStyle(.segmented)
+            .onChange(of: model.summaryEngine) { _, _ in
+                model.saveSummaryPreferences()
+            }
 
-            Text(summaryEngineDescription)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Picker("总结模板", selection: $model.summaryTemplate) {
+                ForEach(SummaryTemplateChoice.allCases) { template in
+                    Text(template.rawValue).tag(template)
+                }
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: model.summaryTemplate) { _, _ in
+                model.saveSummaryPreferences()
+            }
 
-            if model.isSummarizing, let progress = model.summaryProgress, progress < 1 {
-                ProgressView(value: progress)
+            if model.summaryEngine.usesNetwork {
+                Toggle("实时刷新总结", isOn: $model.autoSummaryEnabled)
+                    .onChange(of: model.autoSummaryEnabled) { _, _ in
+                        model.saveSummaryPreferences()
+                    }
+
+                if model.autoSummaryEnabled {
+                    HStack {
+                        Text("刷新间隔")
+                        Spacer()
+                        Picker("刷新间隔", selection: $model.autoSummaryInterval) {
+                            Text("30 秒").tag(30.0)
+                            Text("1 分钟").tag(60.0)
+                            Text("2 分钟").tag(120.0)
+                            Text("3 分钟").tag(180.0)
+                        }
+                        .labelsHidden()
+                        .onChange(of: model.autoSummaryInterval) { _, _ in
+                            model.saveSummaryPreferences()
+                        }
+                    }
+                    Text("只在有新的最终转写/译文时刷新；不会上传原始音频。首次总结会较快生成，之后按所选间隔更新。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
+                Text(summaryEngineDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                if model.summaryEngine.usesNetwork {
+                    Button("API 设置") { showingAISettings = true }
+                        .font(.caption)
+                        .buttonStyle(.bordered)
+                }
+            }
+
+            if model.isSummarizing {
+                if let progress = model.summaryProgress, progress < 1 {
+                    ProgressView(value: progress)
+                } else {
+                    ProgressView()
+                }
             }
 
             if !model.summaryText.isEmpty {
@@ -431,19 +487,19 @@ struct ContentView: View {
 
     private var summaryEngineDescription: String {
         switch model.summaryEngine {
-        case .automatic:
-            return "优先 Apple 本地 AI；不可用时自动使用 Qwen3 离线 AI。Qwen3 第一次需联网下载模型，之后可断网。"
-        case .localAI:
-            return "强制使用 Qwen3 0.6B 4-bit 本地模型；首次需联网下载数百 MB 模型。"
+        case .deepSeek:
+            return "联网调用 DeepSeek，只上传最终转写/译文文本；默认 deepseek-flash。"
+        case .zhipu:
+            return "联网调用智谱 GLM，只上传最终转写/译文文本；默认 glm-5.3-flash。"
         case .quick:
-            return "不下载大模型，直接在设备上做关键句提取；速度最快，但不是生成式 AI。"
+            return "完全本地关键句提取，不调用联网 AI，速度最快但总结能力较弱。"
         }
     }
 
     private var privacyCard: some View {
         VStack(alignment: .leading, spacing: 7) {
             Label("离线与隐私", systemImage: "lock.shield").font(.headline)
-            Text("语音识别和系统 Translation 翻译走 Apple 设备端框架；首次使用语言需要下载资源。本机语音由 AVSpeechSynthesizer 朗读。Qwen3 离线 AI 只在首次下载模型时联网，模型加载后总结在设备本机运行。会话记录保存到本机 Documents。")
+            Text("实时语音识别与 Translation 翻译继续使用 Apple 设备端框架，本机语音由 AVSpeechSynthesizer 朗读。选择 DeepSeek/智谱总结时只上传最终转写与译文文本，不上传原始音频；API Key 使用 iOS 钥匙串保存。会话记录保存到本机 Documents。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

@@ -1,35 +1,29 @@
-# AirTranslate v0.6.0 — 稳定分句 / 双阶段翻译 / 本地语音选择
+# AirTranslate v0.7.0 — DeepSeek / 智谱 AI 总结 + 正式 App 图标
 
-本版重点从“单纯追求速度”转为同时控制翻译质量、朗读延迟和本地语音体验。
+本版在 v0.6 的低延迟同传、稳定分句、双阶段翻译、本地语音选择和 TTS 追赶基础上，增加联网 AI 总结能力。
 
-## 翻译质量
+## AI 总结
 
-- 新增「低延迟 / 高质量」两档。
-- 低延迟模式不再把每个原始 partial 都直接送去翻译，而是优先选择连续识别中已经稳定的文本前缀或带完整标点的片段做预览翻译。
-- partial 译文只作为屏幕预览；SpeechTranscriber 最终结果仍会整句重新翻译并覆盖成最终译文。
-- 高质量模式关闭 partial 翻译，只使用最终语义单元。
+- 默认支持 **DeepSeek** 与 **智谱 GLM**，另保留「快速本地」兜底。
+- DeepSeek 默认模型：`deepseek-flash`；默认接口：`https://api.deepseek.com/chat/completions`。
+- 智谱默认模型：`glm-5.3-flash`；默认接口：`https://open.bigmodel.cn/api/paas/v4/chat/completions`。
+- 模型名与 Endpoint 都可以在 App 内修改，后续模型升级不必重新编译。
+- API Key 使用 iOS Keychain 保存，不写入 UserDefaults、历史记录或导出文字。
+- 联网总结仅发送最终转写与译文文本，不上传原始麦克风音频。
+- 支持「日常 / 会议」两套模板。会议模板会整理会议摘要、明确结论、待办、问题风险与关键时间/数字；信息不足时明确说明，不脑补。
+- 支持可选「实时刷新总结」：首次较快生成，之后可按 30 秒 / 1 分钟 / 2 分钟 / 3 分钟自动刷新；只有最终转写或译文发生变化时才调用 API。
+- 设置页内可直接测试 DeepSeek / 智谱连接。
 
-## 低延迟朗读
+## 构建优化
 
-- 低延迟模式下可单独开启「低延迟朗读」。
-- 当讲话出现短暂停顿（约 520 ms）或形成较明确的句尾时，稳定片段可以提前翻译并朗读，不必一直等整段 final。
-- 已提前朗读的原文前缀会记录下来；最终句到来后只补朗读尚未播放的尾部，避免整句重复。
-- 如果 SpeechTranscriber 后续把已经朗读过的前缀改写，App 会优先避免重复播报，屏幕最终译文仍以完整 final 为准。
-- 保留 v0.5 的 TTS 自动追赶：队列积压时动态提速，严重积压时只丢弃过时音频，不删除字幕和历史记录。
+- v0.7 移除了 MLX/Qwen3 本地总结依赖，减少 Swift Package 依赖与构建负担。
+- 保留快速本地关键句摘要作为断网兜底。
 
-## 本机语音选择
+## 隐私边界
 
-- 新增「目标语言声音」。
-- 使用 `AVSpeechSynthesisVoice.speechVoices()` 读取 iPhone 当前可用的目标语言语音。
-- 可选择「系统默认」或具体本机声音；不接 Azure、Edge 或第三方云 TTS。
-- 语言切换后会自动刷新该语言可用语音列表。
+- SpeechAnalyzer / SpeechTranscriber：设备端语音识别。
+- TranslationSession：设备端系统翻译。
+- AVSpeechSynthesizer：本机朗读。
+- DeepSeek / 智谱：仅在用户主动生成总结，或用户开启“实时刷新总结”时联网上传最终文字。
 
-## 保留能力
-
-- iOS 26 `SpeechAnalyzer + SpeechTranscriber + AssetInventory` 设备端识别。
-- `TranslationSession` 常驻预热，本地系统翻译。
-- Apple 本地 AI / Qwen3 离线总结。
-- 双人对话、AirPods 路由、本地历史与导出。
-- Swift 6 `AVAudioEngine.installTap` 的 `@Sendable` 闪退修复。
-
-GitHub Actions 成功产物：`AirTranslate-v0.6.0-unsigned.ipa`。
+GitHub Actions 成功产物：`AirTranslate-v0.7.0-unsigned.ipa`。

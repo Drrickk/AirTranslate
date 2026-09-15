@@ -41,9 +41,20 @@ enum TranslationQualityMode: String, CaseIterable, Identifiable, Sendable {
 }
 
 enum SummaryEngineChoice: String, CaseIterable, Identifiable, Sendable {
-    case automatic = "自动"
-    case localAI = "离线 AI"
+    case deepSeek = "DeepSeek"
+    case zhipu = "智谱"
     case quick = "快速本地"
+
+    var id: String { rawValue }
+
+    var usesNetwork: Bool {
+        self != .quick
+    }
+}
+
+enum SummaryTemplateChoice: String, CaseIterable, Identifiable, Sendable {
+    case daily = "日常"
+    case meeting = "会议"
 
     var id: String { rawValue }
 }

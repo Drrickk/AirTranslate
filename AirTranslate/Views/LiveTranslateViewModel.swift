@@ -24,9 +24,20 @@ final class LiveTranslateViewModel: ObservableObject {
     @Published var selectedVoiceIdentifier = ""
     @Published var summaryText = ""
     @Published var summaryMode = ""
-    @Published var summaryEngine: SummaryEngineChoice = .automatic
+    @Published var summaryEngine: SummaryEngineChoice = .deepSeek
+    @Published var summaryTemplate: SummaryTemplateChoice = .meeting
+    @Published var deepSeekAPIKey = ""
+    @Published var zhipuAPIKey = ""
+    @Published var deepSeekModel = "deepseek-flash"
+    @Published var zhipuModel = "glm-5.3-flash"
+    @Published var deepSeekEndpoint = "https://api.deepseek.com/chat/completions"
+    @Published var zhipuEndpoint = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    @Published var aiSettingsStatus = ""
+    @Published var isTestingAIConnection = false
     @Published var isSummarizing = false
     @Published var summaryProgress: Double?
+    @Published var autoSummaryEnabled = false
+    @Published var autoSummaryInterval: Double = 60
     @Published var history: [SavedConversation] = []
 
     let forwardTranslationPipe = TranslationRequestPipe()
@@ -47,11 +58,15 @@ final class LiveTranslateViewModel: ObservableObject {
     private var spokenSourcePrefix = ""
     private var voiceSelectionLanguageID = ""
     private var voiceByLanguage: [String: String] = [:]
+    private var autoSummaryTask: Task<Void, Never>?
+    private var lastAutoSummaryAt: Date?
+    private var lastAutoSummarySource = ""
 
     init() {
         if let phase = SpeechCaptureService.lastStartupPhase {
             statusMessage = "上次启动停在：\(phase)"
         }
+        loadAISettings()
         refreshVoiceOptions()
     }
 
@@ -185,6 +200,10 @@ final class LiveTranslateViewModel: ObservableObject {
         resetPartialState(clearVisibleText: true)
         summaryText = ""
         summaryMode = ""
+        autoSummaryTask?.cancel()
+        autoSummaryTask = nil
+        lastAutoSummarySource = ""
+        lastAutoSummaryAt = nil
         statusMessage = "已清空"
     }
 
@@ -231,6 +250,7 @@ final class LiveTranslateViewModel: ObservableObject {
             if request.speakAfterTranslation {
                 speakTranslation(cleanTranslation, request: request)
             }
+            scheduleAutoSummaryIfNeeded()
         }
     }
 
@@ -254,10 +274,22 @@ final class LiveTranslateViewModel: ObservableObject {
     }
 
     func summarize() {
+        performSummary(isAutomatic: false)
+    }
+
+    private func performSummary(isAutomatic: Bool) {
         let text = fullTranscriptForSummary
         guard !text.isEmpty, !isSummarizing else { return }
+        if isAutomatic {
+            guard autoSummaryEnabled, summaryEngine.usesNetwork else { return }
+            guard onlineSummaryConfiguration(for: summaryEngine) != nil else { return }
+            guard text != lastAutoSummarySource else { return }
+        }
+
         isSummarizing = true
-        summaryText = "正在整理…"
+        if !isAutomatic || summaryText.isEmpty {
+            summaryText = "正在整理…"
+        }
         summaryProgress = nil
 
         Task {
@@ -265,22 +297,158 @@ final class LiveTranslateViewModel: ObservableObject {
                 let result = try await summaryService.summarize(
                     text,
                     engine: summaryEngine,
+                    template: summaryTemplate,
+                    configuration: onlineSummaryConfiguration(for: summaryEngine),
                     onProgress: { [weak self] progress, message in
                         await MainActor.run {
                             self?.summaryProgress = progress
-                            self?.summaryText = message
+                            if self?.summaryText.isEmpty == true || !isAutomatic {
+                                self?.summaryText = message
+                            }
                         }
                     }
                 )
                 summaryText = result.text
-                summaryMode = result.mode
+                summaryMode = isAutomatic ? "实时 · \(result.mode)" : result.mode
                 summaryProgress = 1
+                if isAutomatic {
+                    lastAutoSummaryAt = Date()
+                    lastAutoSummarySource = text
+                }
             } catch {
-                summaryText = "总结失败：\(error.localizedDescription)"
-                summaryMode = ""
+                if !isAutomatic {
+                    summaryText = "总结失败：\(error.localizedDescription)"
+                    summaryMode = ""
+                } else {
+                    aiSettingsStatus = "实时总结失败：\(error.localizedDescription)"
+                }
                 summaryProgress = nil
             }
             isSummarizing = false
+            if isAutomatic, fullTranscriptForSummary != lastAutoSummarySource {
+                scheduleAutoSummaryIfNeeded()
+            }
+        }
+    }
+
+    func saveSummaryPreferences() {
+        let defaults = UserDefaults.standard
+        defaults.set(summaryEngine.rawValue, forKey: "ai.summary.engine")
+        defaults.set(summaryTemplate.rawValue, forKey: "ai.summary.template")
+        defaults.set(autoSummaryEnabled, forKey: "ai.summary.autoEnabled")
+        defaults.set(autoSummaryInterval, forKey: "ai.summary.interval")
+        if !autoSummaryEnabled {
+            autoSummaryTask?.cancel()
+            autoSummaryTask = nil
+        } else {
+            scheduleAutoSummaryIfNeeded()
+        }
+    }
+
+    private func scheduleAutoSummaryIfNeeded() {
+        guard autoSummaryEnabled, summaryEngine.usesNetwork, !segments.isEmpty else { return }
+        guard onlineSummaryConfiguration(for: summaryEngine) != nil else { return }
+        guard autoSummaryTask == nil else { return }
+
+        let now = Date()
+        let delaySeconds: Double
+        if let lastAutoSummaryAt {
+            delaySeconds = max(3, autoSummaryInterval - now.timeIntervalSince(lastAutoSummaryAt))
+        } else {
+            // First automatic summary appears quickly, then follows the selected refresh interval.
+            delaySeconds = min(12, max(5, autoSummaryInterval / 4))
+        }
+
+        autoSummaryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.autoSummaryTask = nil
+            self.performSummary(isAutomatic: true)
+        }
+    }
+
+    func saveAISettings() {
+        let defaults = UserDefaults.standard
+        deepSeekModel = deepSeekModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        zhipuModel = zhipuModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        deepSeekEndpoint = deepSeekEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        zhipuEndpoint = zhipuEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        defaults.set(deepSeekModel, forKey: "ai.deepseek.model")
+        defaults.set(zhipuModel, forKey: "ai.zhipu.model")
+        defaults.set(deepSeekEndpoint, forKey: "ai.deepseek.endpoint")
+        defaults.set(zhipuEndpoint, forKey: "ai.zhipu.endpoint")
+        _ = KeychainService.write(deepSeekAPIKey, account: "deepseek")
+        _ = KeychainService.write(zhipuAPIKey, account: "zhipu")
+        saveSummaryPreferences()
+        aiSettingsStatus = "设置已保存到本机；API Key 使用钥匙串保存。"
+    }
+
+    func testAIConnection(_ engine: SummaryEngineChoice) {
+        guard engine.usesNetwork, !isTestingAIConnection else { return }
+        saveAISettings()
+        guard let config = onlineSummaryConfiguration(for: engine) else {
+            aiSettingsStatus = "请先填写 \(engine.rawValue) API Key。"
+            return
+        }
+        isTestingAIConnection = true
+        aiSettingsStatus = "正在测试 \(engine.rawValue)…"
+        Task {
+            do {
+                let reply = try await summaryService.testConnection(configuration: config)
+                aiSettingsStatus = "\(engine.rawValue) 连接正常：\(reply)"
+            } catch {
+                aiSettingsStatus = "\(engine.rawValue) 测试失败：\(error.localizedDescription)"
+            }
+            isTestingAIConnection = false
+        }
+    }
+
+    private func loadAISettings() {
+        let defaults = UserDefaults.standard
+        deepSeekAPIKey = KeychainService.read(account: "deepseek")
+        zhipuAPIKey = KeychainService.read(account: "zhipu")
+        deepSeekModel = defaults.string(forKey: "ai.deepseek.model") ?? "deepseek-flash"
+        zhipuModel = defaults.string(forKey: "ai.zhipu.model") ?? "glm-5.3-flash"
+        deepSeekEndpoint = defaults.string(forKey: "ai.deepseek.endpoint") ?? "https://api.deepseek.com/chat/completions"
+        zhipuEndpoint = defaults.string(forKey: "ai.zhipu.endpoint") ?? "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        if let raw = defaults.string(forKey: "ai.summary.engine"),
+           let saved = SummaryEngineChoice(rawValue: raw) {
+            summaryEngine = saved
+        }
+        if let raw = defaults.string(forKey: "ai.summary.template"),
+           let saved = SummaryTemplateChoice(rawValue: raw) {
+            summaryTemplate = saved
+        }
+        autoSummaryEnabled = defaults.bool(forKey: "ai.summary.autoEnabled")
+        let savedInterval = defaults.double(forKey: "ai.summary.interval")
+        if savedInterval >= 30 { autoSummaryInterval = savedInterval }
+    }
+
+    private func onlineSummaryConfiguration(for engine: SummaryEngineChoice) -> OnlineSummaryConfiguration? {
+        switch engine {
+        case .deepSeek:
+            guard !deepSeekAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return OnlineSummaryConfiguration(
+                engine: .deepSeek,
+                endpoint: deepSeekEndpoint,
+                apiKey: deepSeekAPIKey,
+                model: deepSeekModel
+            )
+        case .zhipu:
+            guard !zhipuAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return OnlineSummaryConfiguration(
+                engine: .zhipu,
+                endpoint: zhipuEndpoint,
+                apiKey: zhipuAPIKey,
+                model: zhipuModel
+            )
+        case .quick:
+            return nil
         }
     }
 
